@@ -74,7 +74,7 @@ python watcher.py           # стежить, поки комп'ютер уві�
 
 1. Додайте бота в канал **адміністратором** з правом «Публікація повідомлень».
 2. Дізнайтеся id каналу: для публічного — просто `@назва_каналу`; для приватного — перешліть будь-який пост каналу боту **@userinfobot** (або запустіть `python watcher.py --chat-id` після того, як додали бота в канал) — буде число виду `-1001234567890`.
-3. GitHub → **Settings → Secrets and variables → Actions → New repository secret**: `TELEGRAM_CHANNEL_ID` = `@назва_каналу` або `-100...`. (Локально — `"channel_id": "..."` у `telegram.json`.)
+3. GitHub → **Settings → Secrets and variables → Actions → New repository secret**: `TELEGRAM_CHANNEL_ID` = `@назва_каналу`, посилання на канал (`https://t.me/назва_каналу`) або `-100...`. (Локально — `"channel_id": "..."` у `telegram.json`.)
 
 Без `TELEGRAM_CHANNEL_ID` кнопки просто немає — усе працює як раніше.
 

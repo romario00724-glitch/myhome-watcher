@@ -9,8 +9,11 @@ myhome.ge -> Telegram: нові оголошення від власників.
   python watcher.py --chat-id   дізнатися chat_id (спершу напишіть боту /start)
   python watcher.py --reset     забути базу й наступного разу заново «запам'ятати» поточні оголошення
   python watcher.py --dump      зберегти «сирі» відповіді сайту у dump_list.json і dump_detail.json
+  python watcher.py --preview ID  надіслати в робочий чат, як оголошення ID виглядатиме в каналі
+  python watcher.py --post ID     одразу опублікувати оголошення ID у канал
 
-Посилання на пошук беруться з searches.txt, база побачених оголошень — state.json.
+Посилання на пошук беруться з searches.txt, база побачених оголошень — state.json,
+шаблон поста для каналу — channel_template.txt.
 """
 
 import argparse
@@ -34,6 +37,9 @@ from pathlib import Path
 # а на своєму комп'ютері — з файлу telegram.json поруч зі скриптом.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # кілька чатів — через кому
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # канал для кнопки «Додати в канал»: @назва або -100...
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # якщо задано — текст поста для каналу допише ШІ
+OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-5-mini"
 
 LANG = "ru"                    # мова назв і посилань з myhome.ge: ru / en / ka
 ONLY_OWNERS = True             # завжди додавати фільтр «Власник» (owner_type=physical)
@@ -46,12 +52,16 @@ MAX_ALERTS_PER_RUN = 25        # запобіжник від спаму; реш�
 LOOP_MINUTES = 10              # інтервал у безперервному режимі
 FAIL_ALERT_AFTER = 6           # після скількох невдалих перевірок поспіль написати в Telegram
 KEEP_DAYS = 60                 # скільки днів пам'ятати побачені оголошення
+CHANNEL_MAX_PHOTOS = 10        # скільки фото брати в пост каналу (Telegram дозволяє до 10)
+CHANNEL_HIDE_PHONES = True     # прибирати телефони власника з опису в каналі
+CHANNEL_DESCRIPTION_MAX = 350  # скільки символів опису власника брати в пост (0 — весь, скільки влізе)
 # ──────────────────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
 SEARCHES_FILE = BASE_DIR / "searches.txt"
 STATE_FILE = BASE_DIR / "state.json"
-TELEGRAM_FILE = BASE_DIR / "telegram.json"  # {"token": "...", "chat_id": "..."} — не викладати на GitHub!
+TELEGRAM_FILE = BASE_DIR / "telegram.json"  # {"token": "...", "chat_id": "...", "channel_id": "..."} — не викладати на GitHub!
+CHANNEL_TEMPLATE_FILE = BASE_DIR / "channel_template.txt"
 
 API_URL = "https://api-statements.tnet.ge/v1/statements"
 SITE = "https://www.myhome.ge"
@@ -84,8 +94,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def load_telegram_file():
-    """Доповнює токен і chat_id з telegram.json, якщо їх не задано змінними середовища."""
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    """Доповнює токен, chat_id і канал з telegram.json, якщо їх не задано змінними середовища."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID, OPENAI_API_KEY
     if not TELEGRAM_FILE.exists():
         return
     try:
@@ -95,9 +105,25 @@ def load_telegram_file():
         return
     TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or str(cfg.get("token") or "").strip()
     TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID or str(cfg.get("chat_id") or "").strip()
+    TELEGRAM_CHANNEL_ID = TELEGRAM_CHANNEL_ID or str(cfg.get("channel_id") or "").strip()
+    OPENAI_API_KEY = OPENAI_API_KEY or str(cfg.get("openai_key") or "").strip()
 
 
 load_telegram_file()
+
+
+def normalize_channel(value):
+    """«https://t.me/arendabatumi3», «t.me/arendabatumi3», «arendabatumi3» → «@arendabatumi3»; -100... лишається."""
+    value = str(value or "").strip()
+    match = re.fullmatch(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})/?", value)
+    if match:
+        return "@" + match.group(1)
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,}", value):
+        return "@" + value
+    return value
+
+
+TELEGRAM_CHANNEL_ID = normalize_channel(TELEGRAM_CHANNEL_ID)
 
 
 class FetchError(Exception):
@@ -295,12 +321,27 @@ def enrich_with_details(item):
             item[key] = detail[key]
     if len(clean(detail.get("comment"))) > len(clean(item.get("comment"))):
         item["comment"] = detail["comment"]
+    if len(image_urls(detail)) > len(image_urls(item)):
+        item["images"] = detail["images"]
     return item
+
+
+def fetch_listing(listing_id):
+    """Повна картка оголошення за id (для публікації в канал)."""
+    data = http_get_json(detail_url(listing_id), api_headers())
+    detail = as_dict(as_dict(as_dict(data).get("data")).get("statement"))
+    if not detail:
+        raise FetchError(f"оголошення {listing_id} не знайдено — можливо, його вже зняли")
+    detail.setdefault("id", listing_id)
+    return detail
 
 
 # ─────────────────────────── аналіз оголошення ───────────────────────────
 
 PHONE_RE = re.compile(r"(?<![\d+])(?:\+?995[\s\-.]?)?(5\d{2}(?:[\s\-.]?\d){6})(?!\d)")
+PHONE_WITH_LABEL_RE = re.compile(  # «Тел.: 599 12 34 56», «звоните 599123456» — прибирається цілком
+    r"(?i)(?:\b(?:тел(?:ефон)?|моб(?:ильный)?|звоните|пишите|whats\s?app|viber|telegram|phone|tel|"
+    r"вотсап|ватсап|вайбер|ტელ(?:ეფონი)?)\b\.?[\s:.\-–—]*(?:по\s+)?)?" + PHONE_RE.pattern)
 
 
 def find_phone(*texts):
@@ -419,6 +460,25 @@ def _parse_time(raw):
     return dt.astimezone(GEORGIA_TZ) if dt.tzinfo else dt
 
 
+def facts_text(item):
+    """«45 м² · кімнат: 2 · спалень: 1 · поверх 5/12»."""
+    facts = []
+    if clean(item.get("area")):
+        facts.append(f"{fmt_area(item['area'])} м²")
+    if clean(item.get("room")):
+        facts.append(f"кімнат: {clean(item['room'])}")
+    if clean(item.get("bedroom")):
+        facts.append(f"спалень: {clean(item['bedroom'])}")
+    if clean(item.get("floor")):
+        total = clean(item.get("total_floors"))
+        facts.append(f"поверх {clean(item['floor'])}" + (f"/{total}" if total else ""))
+    return " · ".join(facts)
+
+
+def place_text(item):
+    return ", ".join(p for p in (clean(item.get("urban_name")), clean(item.get("address"))) if p)
+
+
 def listing_time(item):
     """«25.09 02:01», а якщо оголошення потім піднімали — «25.09 02:01, оновлено 27.09 14:03»."""
     created = _parse_time(item.get("created_at") or item.get("create_date"))
@@ -436,13 +496,21 @@ def listing_url(item):
     return f"{SITE}/{LANG}/pr/{item['id']}/"
 
 
-def main_image(item):
-    images = [im for im in (item.get("images") or []) if isinstance(im, dict)]
-    images.sort(key=lambda im: not im.get("is_main"))
+def image_urls(item):
+    """Адреси всіх фото оголошення, головне — першим."""
+    images = item.get("images") if isinstance(item.get("images"), list) else []
+    images = sorted(images, key=lambda im: not (isinstance(im, dict) and im.get("is_main")))
+    urls = []
     for im in images:
-        if im.get("large") or im.get("thumb"):
-            return im.get("large") or im.get("thumb")
-    return ""
+        url = im if isinstance(im, str) else (im.get("large") or im.get("thumb")) if isinstance(im, dict) else ""
+        if isinstance(url, str) and url.startswith("http") and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def main_image(item):
+    urls = image_urls(item)
+    return urls[0] if urls else ""
 
 
 def plural(n, one, few, many):
@@ -465,20 +533,11 @@ def build_message(item, label, count, max_len=4096):
     if price_text(item):
         lines.append(f"💵 {esc(price_text(item))}")
 
-    facts = []
-    if clean(item.get("area")):
-        facts.append(f"{esc(fmt_area(item['area']))} м²")
-    if clean(item.get("room")):
-        facts.append(f"кімнат: {esc(item['room'])}")
-    if clean(item.get("bedroom")):
-        facts.append(f"спалень: {esc(item['bedroom'])}")
-    if clean(item.get("floor")):
-        total = clean(item.get("total_floors"))
-        facts.append(f"поверх {esc(item['floor'])}" + (f"/{esc(total)}" if total else ""))
+    facts = esc(facts_text(item))
     if facts:
-        lines.append("📐 " + " · ".join(facts))
+        lines.append("📐 " + facts)
 
-    place = ", ".join(p for p in (clean(item.get("urban_name")), clean(item.get("address"))) if p)
+    place = place_text(item)
     if place:
         lines.append(f"📍 {esc(place)}")
 
@@ -538,15 +597,15 @@ def telegram_ready():
     return bool(TELEGRAM_BOT_TOKEN and chat_ids())
 
 
-def _post_json(url, payload):
+def _post_json(url, payload, headers=None, timeout=30):
     """POST з JSON → (код, текст відповіді). Спершу через curl_cffi, інакше — urllib."""
     if cffi_requests:
-        resp = cffi_requests.post(url, json=payload, timeout=30)
+        resp = cffi_requests.post(url, json=payload, headers=headers, timeout=timeout)
         return resp.status_code, resp.text
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **(headers or {})})
     try:
-        with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
@@ -582,20 +641,29 @@ def send_text(text):
             log(f"Telegram ({chat}): {result.get('description')}")
 
 
+def channel_button(listing_id):
+    """Кнопка під оголошенням у робочому чаті (лише якщо канал налаштований)."""
+    if not TELEGRAM_CHANNEL_ID:
+        return {}
+    return {"reply_markup": {"inline_keyboard": [[
+        {"text": "📢 Додати в канал", "callback_data": f"ch:{listing_id}"}]]}}
+
+
 def send_listing(item, label, count):
     """Надсилає оголошення у всі чати. True, якщо дійшло хоча б в один."""
     photo = main_image(item)
     caption = build_message(item, label, count, max_len=1024)
     full_text = build_message(item, label, count)
+    button = channel_button(item["id"])
     delivered = False
     for chat in chat_ids():
         result = {"ok": False}
         if photo:
-            result = tg_call("sendPhoto", {"chat_id": chat, "photo": photo,
-                                           "caption": caption, "parse_mode": "HTML"})
+            result = tg_call("sendPhoto", {"chat_id": chat, "photo": photo, "caption": caption,
+                                           "parse_mode": "HTML", **button})
         if not result.get("ok"):  # фото не підійшло — шлемо текстом
             result = tg_call("sendMessage", {"chat_id": chat, "text": full_text,
-                                             "parse_mode": "HTML"})
+                                             "parse_mode": "HTML", **button})
         if result.get("ok"):
             delivered = True
         else:
@@ -604,10 +672,358 @@ def send_listing(item, label, count):
     return delivered
 
 
+# ─────────────────────────────── канал ───────────────────────────────
+
+DEFAULT_CHANNEL_TEMPLATE = """{deal_tag} {bedrooms_tag} {plan_tag} {district_tag} {city_tag}
+🏠 <b>{rooms_title}</b>
+💰 {price}
+📍 {place}
+📐 {facts}
+
+{description}"""
+DEAL_NAMES = {1: "Продаж", 2: "Оренда"}
+PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+
+def description_text(item):
+    """Опис для каналу: одним абзацом, без HTML і (за бажанням) без телефонів власника."""
+    text = re.sub(r"(?i)<br\s*/?>|</?(?:p|div|li)\b[^>]*>", "\n", str(item.get("comment") or ""))
+    text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    lines = []
+    for line in text.splitlines():
+        if CHANNEL_HIDE_PHONES and PHONE_RE.search(line):
+            line = re.sub(r"\s+([.,;!?])", r"\1", PHONE_WITH_LABEL_RE.sub("", line))
+            if len(re.sub(r"\W", "", line)) < 20:  # лишилось щось на кшталт «Тел.:» — рядок геть
+                continue
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:  # в один абзац: рядок без розділового знака в кінці закриваємо крапкою
+            lines.append(line if line[-1] in ".!?:;,…" else line + ".")
+    return " ".join(lines)
+
+
+def hashtag(value, prefix="", camel=False):
+    """«Старый Батуми» → #старыйбатуми, з camel=True і prefix="сдамквартиру" → #сдамквартируСтарыйБатуми."""
+    words = re.findall(r"[^\W_]+", clean(value))
+    if not words:
+        return ""
+    tag = "".join(w[:1].upper() + w[1:] for w in words) if camel else "".join(words).lower()
+    return f"#{prefix}{tag}"
+
+
+def layout(item):
+    """Планування в місцевому форматі: (кімнат, спалень, «1+1» або «студия»)."""
+    rooms, beds = to_int(clean(item.get("room"))), to_int(clean(item.get("bedroom")))
+    if rooms == 1 or beds == 0:
+        return rooms, beds, "студия"
+    if beds is None and rooms:
+        beds = rooms - 1
+    return rooms, beds, f"{beds}+1" if beds else ""
+
+
+def plan_values(item):
+    rooms, beds, plan = layout(item)
+    if plan == "студия":
+        return {"rooms_title": "квартира-студия", "plan": "студия (кухня-гостиная и спальная зона)",
+                "plan_tag": "#студия", "bedrooms_tag": ""}
+    if not plan:
+        return {"rooms_title": f"{rooms}-комнатная квартира" if rooms else "квартира",
+                "plan": "", "plan_tag": "", "bedrooms_tag": ""}
+    bed_words = "отдельная спальня" if beds == 1 else f"{beds} {plural(beds, 'спальня', 'спальни', 'спален')}"
+    return {"rooms_title": f"{rooms or beds + 1}-комнатная квартира ({plan})",
+            "plan": f"{plan} ({bed_words} + кухня-гостиная)",
+            "plan_tag": f"#{beds}плюс1",
+            "bedrooms_tag": f"#{beds}{plural(beds, 'спальня', 'спальни', 'спален')}"}
+
+
+def channel_values(item):
+    """Значення для {назв} у channel_template.txt."""
+    price = as_dict(item.get("price"))
+    gel = as_dict(price.get("1")).get("price_total")
+    usd = as_dict(price.get("2")).get("price_total")
+    deal = DEAL_NAMES.get(to_int(item.get("deal_type_id")) or to_int(item.get("deal_type")), "")
+    floor, floors = clean(item.get("floor")), clean(item.get("total_floors"))
+    desc = description_text(item)
+    if CHANNEL_DESCRIPTION_MAX and len(desc) > CHANNEL_DESCRIPTION_MAX:
+        cut = desc[:CHANNEL_DESCRIPTION_MAX - 1]
+        cut = cut[:cut.rfind(" ")] if " " in cut[CHANNEL_DESCRIPTION_MAX // 2:] else cut
+        desc = cut.rstrip(" ,.;:\n") + "…"
+    plan = plan_values(item)
+    ai = as_dict(item.get("_ai"))
+    district = clean(item.get("urban_name"))
+    headline = ai.get("headline") or " ".join(
+        x for x in ("Уютная", plan["rooms_title"] + ("," if district else ""), district) if x)
+    points = [f"✔️ {p}" for p in ai.get("points") or []] or ([f"✔️ {desc}"] if desc else [])
+    return {
+        **plan,
+        "headline": headline,
+        "points": "\n".join(points),
+        "terms": ai.get("terms") or "",
+        "id": clean(item.get("id")),
+        "title": clean(item.get("dynamic_title")),
+        "price": price_text(item),
+        "price_usd": f"{fmt_num(usd)}$" if usd else "",
+        "price_gel": f"{fmt_num(gel)} ₾" if gel else "",
+        "price_main": f"{fmt_num(usd)}$" if usd else f"{fmt_num(gel)} ₾" if gel else "",
+        "facts": facts_text(item),
+        "area": fmt_area(item["area"]) if clean(item.get("area")) else "",
+        "rooms": clean(item.get("room")),
+        "bedrooms": clean(item.get("bedroom")),
+        "floor": floor,
+        "floors": floors,
+        "floor_full": f"{floor}/{floors}" if floor and floors else floor,
+        "place": place_text(item),
+        "city": clean(item.get("city_name")),
+        "district": clean(item.get("urban_name")),
+        "address": clean(item.get("address")),
+        "deal": deal,
+        "deal_tag": hashtag(deal),
+        "district_tag": hashtag(item.get("urban_name")),
+        "district_rent_tag": hashtag(item.get("urban_name"), "сдамквартиру", camel=True),
+        "city_tag": hashtag(item.get("city_name")),
+        "owner_phone": find_phone(item.get("user_phone_number"), item.get("additional_phone_number"),
+                                  item.get("comment")),
+        "link": listing_url(item),
+        "description": desc,
+    }
+
+
+AI_PROMPT = """Ты помогаешь вести Telegram-канал «Аренда Батуми» с объявлениями об аренде квартир.
+По данным объявления с myhome.ge подготовь части поста на русском языке.
+
+Верни JSON:
+{"headline": "...", "points": ["...", "..."], "terms": "..."}
+
+headline — одна строка вида «Уютная 2-комнатная квартира (1+1) в Квариати»: прилагательное
+(уютная, светлая, просторная, современная — по описанию), тип квартиры и район с правильным
+падежом («в Старом Батуми», «на Новом бульваре», «в районе Аэропорта»). Без эмодзи.
+
+points — 2–4 коротких пункта «Название: значение», только то, что реально есть в описании:
+Срок, Состояние, Мебель и техника, Дом, Вид, Парковка, Животные, Особенности и т.п.
+Не повторяй планировку, площадь, этаж, цену и адрес — они уже есть в посте.
+Пример: «Срок: Аренда на 9 месяцев (до летнего сезона)», «Состояние: Новый ремонт, всё необходимое для проживания».
+
+terms — условия оплаты и договора в скобках, если они есть в описании, например
+«(договор, оплата за первый и последний месяцы)». Если не указаны — пустая строка.
+
+Правила: ничего не выдумывай — если чего-то нет в данных, не пиши об этом. Не упоминай
+собственника, агентства, комиссию, телефоны, имена и ссылки. Если описание на грузинском
+или английском — переведи. Весь ответ вместе — не длиннее 400 символов."""
+
+
+def ai_parts(item):
+    """Просить OpenAI дописати заголовок, пункти й умови. Повертає dict або кидає FetchError."""
+    facts = {
+        "тип": plan_values(item)["rooms_title"], "планировка": plan_values(item)["plan"],
+        "площадь_м2": fmt_area(item["area"]) if clean(item.get("area")) else "",
+        "этаж": clean(item.get("floor")), "этажей_в_доме": clean(item.get("total_floors")),
+        "город": clean(item.get("city_name")), "район": clean(item.get("urban_name")),
+        "адрес": clean(item.get("address")), "заголовок_на_сайте": clean(item.get("dynamic_title")),
+        "цена": price_text(item), "описание": description_text(item),
+    }
+    payload = {"model": OPENAI_MODEL, "response_format": {"type": "json_object"},
+               "max_completion_tokens": 4000,
+               "messages": [{"role": "system", "content": AI_PROMPT},
+                            {"role": "user", "content": json.dumps(facts, ensure_ascii=False)}]}
+    try:
+        status, body = _post_json("https://api.openai.com/v1/chat/completions", payload,
+                                  {"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=120)
+    except Exception as e:
+        raise FetchError(f"мережева помилка: {e}") from e
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise FetchError(f"HTTP {status}")
+    if status != 200:
+        raise FetchError(clean(as_dict(data.get("error")).get("message")) or f"HTTP {status}")
+    try:
+        parts = json.loads(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise FetchError("відповідь не в очікуваному форматі")
+    points = parts.get("points") if isinstance(parts.get("points"), list) else []
+    points = [clean(p).lstrip("✔️-•· ").strip() for p in points if clean(p)]
+    while len("".join(points)) > 450:  # щоб пост влазив у підпис до фото
+        points.pop()
+    terms = clean(parts.get("terms"))
+    if terms and not terms.startswith("("):
+        terms = f"({terms.strip('()')})"
+    return {"headline": clean(parts.get("headline")).rstrip("."), "points": points, "terms": terms}
+
+
+def add_ai_parts(item):
+    """Один раз на оголошення дописує item["_ai"]; помилку кладе в item["_ai_error"]."""
+    if not OPENAI_API_KEY or "_ai" in item or "_ai_error" in item:
+        return
+    try:
+        item["_ai"] = ai_parts(item)
+    except FetchError as e:
+        item["_ai_error"] = str(e)
+        log(f"OpenAI, оголошення {item.get('id')}: {e}")
+
+
+def load_channel_template():
+    if CHANNEL_TEMPLATE_FILE.exists():
+        text = CHANNEL_TEMPLATE_FILE.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    return DEFAULT_CHANNEL_TEMPLATE
+
+
+def render_template(template, values):
+    """Підставляє значення. Рядок, де всі {назви} порожні, викидається цілком."""
+    out = []
+    for line in template.splitlines():
+        names = PLACEHOLDER_RE.findall(line)
+        known = [n for n in names if n in values]
+        if known and not any(values[n] for n in known):
+            continue
+        line = PLACEHOLDER_RE.sub(
+            lambda m: html.escape(values[m.group(1)], quote=False) if m.group(1) in values else m.group(0),
+            line)
+        out.append(re.sub(r"(?<=\S) {2,}", " ", line).rstrip() if known else line)
+    text = re.sub(r"<(b|i|u|s)>\s*</\1>", "", "\n".join(out))  # порожні <i></i> від порожніх {назв}
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def build_channel_post(item, max_len=1024):
+    """Текст поста для каналу; опис скорочується, щоб усе влізло в підпис до фото."""
+    template, values = load_channel_template(), channel_values(item)
+    desc = values["description"]
+    text = render_template(template, values)
+    if visible_len(text) <= max_len:
+        return text
+    budget = max_len - visible_len(render_template(template, {**values, "description": ""})) - 3
+    if budget < 40:
+        values["description"] = ""
+    else:
+        cut = desc[:budget - 1]
+        cut = cut[:cut.rfind(" ")] if " " in cut[budget // 2:] else cut
+        values["description"] = cut.rstrip(" ,.;:\n") + "…"
+    text = render_template(template, values)
+    return text if visible_len(text) <= max_len else text[:max_len]  # запобіжник
+
+
+def message_link(message):
+    chat = as_dict(message.get("chat"))
+    if chat.get("username"):
+        return f"https://t.me/{chat['username']}/{message.get('message_id')}"
+    cid = str(chat.get("id", ""))
+    if cid.startswith("-100"):
+        return f"https://t.me/c/{cid[4:]}/{message.get('message_id')}"
+    return ""
+
+
+def publish_post(chat_id, item, fallback_photo=""):
+    """Шле альбом із підписом (або одне фото, або текст). Повертає (перше повідомлення, помилка)."""
+    add_ai_parts(item)
+    caption = build_channel_post(item, 1024)
+    photos = image_urls(item)[:CHANNEL_MAX_PHOTOS] or ([fallback_photo] if fallback_photo else [])
+    errors = []
+    if len(photos) > 1:
+        media = [{"type": "photo", "media": url} for url in photos]
+        media[0].update(caption=caption, parse_mode="HTML")
+        result = tg_call("sendMediaGroup", {"chat_id": chat_id, "media": media})
+        if result.get("ok") and result.get("result"):
+            return result["result"][0], ""
+        errors.append(result.get("description"))
+    for photo in [p for p in (photos[:1] + [fallback_photo]) if p][:2]:
+        result = tg_call("sendPhoto", {"chat_id": chat_id, "photo": photo,
+                                       "caption": caption, "parse_mode": "HTML"})
+        if result.get("ok"):
+            return result["result"], ""
+        errors.append(result.get("description"))
+    result = tg_call("sendMessage", {"chat_id": chat_id, "text": build_channel_post(item, 4096),
+                                     "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}})
+    if result.get("ok"):
+        return result["result"], ""
+    errors.append(result.get("description"))
+    return None, "; ".join(str(e) for e in errors if e)
+
+
+def largest_photo(message):
+    sizes = [p for p in (message.get("photo") or []) if isinstance(p, dict)]
+    return max(sizes, key=lambda p: p.get("width", 0) * p.get("height", 0))["file_id"] if sizes else ""
+
+
+def post_to_channel(state, listing_id, fallback_photo=""):
+    """Публікує оголошення в канал. Повертає (посилання на пост або "", помилка або "", помилка ШІ або "")."""
+    key = str(listing_id)
+    if key in state["posted"]:
+        return state["posted"][key][0], "", ""
+    try:
+        item = fetch_listing(listing_id)
+    except FetchError as e:
+        return "", f"myhome.ge: {e}", ""
+    message, error = publish_post(TELEGRAM_CHANNEL_ID, item, fallback_photo)
+    if not message:
+        return "", f"Telegram: {error}", ""
+    link = message_link(message)
+    state["posted"][key] = [link, today()]
+    log(f"оголошення {listing_id} опубліковано в канал {link}")
+    return link, "", item.get("_ai_error", "")
+
+
+def handle_callback(state, query):
+    chat_msg = as_dict(query.get("message"))
+    chat_id = str(as_dict(chat_msg.get("chat")).get("id", ""))
+    data = str(query.get("data") or "")
+    if chat_id not in chat_ids() or not re.fullmatch(r"ch:\d+", data):
+        tg_call("answerCallbackQuery", {"callback_query_id": query.get("id")})
+        return
+    listing_id = int(data[3:])
+    if not TELEGRAM_CHANNEL_ID:
+        link, error, ai_error = "", "канал не налаштований (TELEGRAM_CHANNEL_ID)", ""
+    else:
+        link, error, ai_error = post_to_channel(state, listing_id, largest_photo(chat_msg))
+    tg_call("answerCallbackQuery", {"callback_query_id": query.get("id"),
+                                    "text": "❌ Не вдалося, деталі в чаті" if error else "✅ Опубліковано в каналі"})
+    if error:
+        log(f"канал, оголошення {listing_id}: {error}")
+        tg_call("sendMessage", {"chat_id": chat_id,
+                                "text": f"❌ Не вдалося опублікувати в канал: {html.escape(error)}\n"
+                                        "Натисніть кнопку ще раз, коли виправите.",
+                                "parse_mode": "HTML",
+                                "reply_parameters": {"message_id": chat_msg.get("message_id"),
+                                                     "allow_sending_without_reply": True}})
+        return
+    if ai_error:
+        tg_call("sendMessage", {"chat_id": chat_id,
+                                "text": f"⚠️ OpenAI не відповів ({html.escape(ai_error)}), тому пост "
+                                        "зібрано за звичайним шаблоном — за потреби підправте його в каналі.",
+                                "parse_mode": "HTML",
+                                "reply_parameters": {"message_id": chat_msg.get("message_id"),
+                                                     "allow_sending_without_reply": True}})
+    done = {"text": "✅ В каналі", "url": link} if link else {"text": "✅ В каналі", "callback_data": data}
+    tg_call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": chat_msg.get("message_id"),
+                                       "reply_markup": {"inline_keyboard": [[done]]}})
+
+
+def process_updates(state, wait=0):
+    """Обробляє натискання кнопок «Додати в канал». wait — скільки секунд чекати нових (long polling)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        return
+    payload = {"timeout": wait, "allowed_updates": ["callback_query"]}
+    if state["tg_offset"]:
+        payload["offset"] = state["tg_offset"]
+    result = tg_call("getUpdates", payload)
+    if not result.get("ok"):
+        log(f"Telegram getUpdates: {result.get('description')}")
+        return
+    for update in result.get("result", []):
+        state["tg_offset"] = int(update["update_id"]) + 1
+        query = as_dict(update.get("callback_query"))
+        if query:
+            try:
+                handle_callback(state, query)
+            except Exception as e:  # одна невдала кнопка не має ламати перевірку оголошень
+                log(f"кнопка: {e}")
+
+
 # ─────────────────────────────── база (state.json) ───────────────────────────────
 
 def new_state():
-    return {"version": 1, "searches": {}, "seen": {}, "authors": {}, "fail_streak": 0}
+    return {"version": 1, "searches": {}, "seen": {}, "authors": {}, "fail_streak": 0,
+            "tg_offset": 0, "posted": {}}
 
 
 def load_state():
@@ -627,6 +1043,7 @@ def save_state(state):
     cutoff = (datetime.now(GEORGIA_TZ) - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
     state["seen"] = {day: sorted(set(ids)) for day, ids in state["seen"].items() if day >= cutoff}
     state["authors"] = {k: v for k, v in state["authors"].items() if v[1] >= cutoff}
+    state["posted"] = {k: v for k, v in state["posted"].items() if v[1] >= cutoff}
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True, indent=0), encoding="utf-8")
     tmp.replace(STATE_FILE)
@@ -743,6 +1160,7 @@ def run_once(state):
 def cmd_once():
     state = load_state()
     try:
+        process_updates(state)  # спершу — натискання «Додати в канал» з минулих разів
         run_once(state)
     finally:
         save_state(state)
@@ -755,7 +1173,37 @@ def cmd_loop():
         log("Telegram не налаштований — оголошення друкуватимуться тут, у консолі.")
     while True:
         cmd_once()
-        time.sleep(LOOP_MINUTES * 60 + random.randint(0, 45))
+        next_check = time.time() + LOOP_MINUTES * 60 + random.randint(0, 45)
+        while time.time() < next_check:
+            if not TELEGRAM_CHANNEL_ID:
+                time.sleep(max(0, next_check - time.time()))
+                break
+            state = load_state()  # між перевірками одразу реагуємо на кнопки
+            process_updates(state, wait=int(min(50, max(1, next_check - time.time()))))
+            save_state(state)
+
+
+def cmd_preview(listing_id):
+    """Надсилає в робочий чат пост у тому вигляді, в якому він піде в канал."""
+    if not telegram_ready():
+        raise ConfigError("спершу вкажіть TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID")
+    item = fetch_listing(listing_id)
+    for chat in chat_ids():
+        message, error = publish_post(chat, item)
+        log(f"прев'ю надіслано в {chat} ✅" if message else f"прев'ю в {chat} не вдалося: {error}")
+    return 0
+
+
+def cmd_post(listing_id):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+        raise ConfigError("спершу вкажіть TELEGRAM_BOT_TOKEN і TELEGRAM_CHANNEL_ID")
+    state = load_state()
+    try:
+        link, error, _ = post_to_channel(state, listing_id)
+    finally:
+        save_state(state)
+    log(f"Опубліковано: {link or '✅'}" if not error else f"Не вдалося: {error}")
+    return 0 if not error else 1
 
 
 def cmd_test():
@@ -804,10 +1252,11 @@ def cmd_dump():
 def cmd_chat_id():
     if not TELEGRAM_BOT_TOKEN:
         raise ConfigError("спершу вкажіть TELEGRAM_BOT_TOKEN")
-    result = tg_call("getUpdates", {"limit": 100})
+    result = tg_call("getUpdates", {"limit": 100, "allowed_updates": [
+        "message", "edited_message", "channel_post", "my_chat_member", "callback_query"]})
     if not result.get("ok"):
         raise ConfigError(f"Telegram відповів: {result.get('description')}")
-    chats, migrated = {}, set()
+    chats, migrated, channels = {}, set(), set()
     for update in result.get("result", []):
         for kind in ("message", "edited_message", "channel_post", "my_chat_member"):
             event = as_dict(update.get(kind))
@@ -816,6 +1265,8 @@ def cmd_chat_id():
                 name = chat.get("title") or " ".join(
                     filter(None, (chat.get("first_name"), chat.get("last_name")))) or chat.get("username")
                 chats[chat["id"]] = name or ""
+                if chat.get("type") == "channel":
+                    channels.add(chat["id"])
             if event.get("migrate_to_chat_id"):  # група стала супергрупою й отримала новий id
                 migrated.add(chat.get("id"))
                 chats.setdefault(event["migrate_to_chat_id"], chats.get(chat.get("id"), ""))
@@ -825,7 +1276,13 @@ def cmd_chat_id():
         log("Порожньо. Напишіть у групі (або боту) /start і запустіть ще раз.")
         return 0
     for chat_id, name in chats.items():
-        print(f"chat_id = {chat_id}    ({name})")
+        kind = "  ← канал: це значення для TELEGRAM_CHANNEL_ID" if chat_id in channels else ""
+        print(f"chat_id = {chat_id}    ({name}){kind}")
+    for cid in channels:
+        chats.pop(cid, None)
+    if not chats:
+        log("Робочого чату не знайдено. Напишіть у групі (або боту) /start і запустіть ще раз.")
+        return 0
 
     groups = [cid for cid in chats if int(cid) < 0]
     choice = groups[0] if len(groups) == 1 else (next(iter(chats)) if not groups and len(chats) == 1 else None)
@@ -834,8 +1291,10 @@ def cmd_chat_id():
         return 0
     global TELEGRAM_CHAT_ID
     TELEGRAM_CHAT_ID = str(choice)
-    TELEGRAM_FILE.write_text(json.dumps({"token": TELEGRAM_BOT_TOKEN, "chat_id": TELEGRAM_CHAT_ID},
-                                        ensure_ascii=False, indent=2), encoding="utf-8")
+    config = {"token": TELEGRAM_BOT_TOKEN, "chat_id": TELEGRAM_CHAT_ID}
+    if TELEGRAM_CHANNEL_ID:
+        config["channel_id"] = TELEGRAM_CHANNEL_ID
+    TELEGRAM_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     send_text("✅ Бот підключено! Сюди приходитимуть нові оголошення від власників з myhome.ge.")
     log(f"chat_id {choice} ({chats[choice]}) збережено в telegram.json, у чат надіслано привітання")
     return 0
@@ -856,6 +1315,8 @@ def main():
     group.add_argument("--chat-id", action="store_true", help="показати chat_id з повідомлень боту")
     group.add_argument("--reset", action="store_true", help="забути базу побачених оголошень")
     group.add_argument("--dump", action="store_true", help="зберегти сирі відповіді сайту у файли")
+    group.add_argument("--preview", type=int, metavar="ID", help="показати в чаті, як оголошення виглядатиме в каналі")
+    group.add_argument("--post", type=int, metavar="ID", help="опублікувати оголошення в канал")
     args = parser.parse_args()
     try:
         if args.chat_id:
@@ -866,6 +1327,10 @@ def main():
             return cmd_test()
         if args.dump:
             return cmd_dump()
+        if args.preview:
+            return cmd_preview(args.preview)
+        if args.post:
+            return cmd_post(args.post)
         if args.once:
             return cmd_once()
         return cmd_loop()

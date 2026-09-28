@@ -52,6 +52,7 @@ FAIL_ALERT_AFTER = 6           # після скількох невдалих п
 KEEP_DAYS = 60                 # скільки днів пам'ятати побачені оголошення
 CHANNEL_MAX_PHOTOS = 10        # скільки фото брати в пост каналу (Telegram дозволяє до 10)
 CHANNEL_HIDE_PHONES = True     # прибирати телефони власника з опису в каналі
+CHANNEL_DESCRIPTION_MAX = 350  # скільки символів опису власника брати в пост (0 — весь, скільки влізе)
 # ──────────────────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -653,21 +654,19 @@ def send_listing(item, label, count):
 
 # ─────────────────────────────── канал ───────────────────────────────
 
-DEFAULT_CHANNEL_TEMPLATE = """🏠 <b>{title}</b>
-
+DEFAULT_CHANNEL_TEMPLATE = """{deal_tag} {bedrooms_tag} {plan_tag} {district_tag} {city_tag}
+🏠 <b>{rooms_title}</b>
 💰 {price}
-📐 {facts}
 📍 {place}
+📐 {facts}
 
-{description}
-
-{deal_tag} {district_tag}"""
+{description}"""
 DEAL_NAMES = {1: "Продаж", 2: "Оренда"}
 PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
 def description_text(item):
-    """Опис для каналу: з абзацами, без HTML і (за бажанням) без телефонів власника."""
+    """Опис для каналу: одним абзацом, без HTML і (за бажанням) без телефонів власника."""
     text = re.sub(r"(?i)<br\s*/?>|</?(?:p|div|li)\b[^>]*>", "\n", str(item.get("comment") or ""))
     text = html.unescape(re.sub(r"<[^>]+>", "", text))
     lines = []
@@ -676,13 +675,44 @@ def description_text(item):
             line = PHONE_RE.sub("", line)
             if len(re.sub(r"\W", "", line)) < 20:  # лишилось щось на кшталт «Тел.:» — рядок геть
                 continue
-        lines.append(re.sub(r"[ \t]+", " ", line).strip())
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:  # в один абзац: рядок без розділового знака в кінці закриваємо крапкою
+            lines.append(line if line[-1] in ".!?:;,…" else line + ".")
+    return " ".join(lines)
 
 
-def hashtag(value):
-    tag = re.sub(r"\W+", "_", clean(value)).strip("_")
-    return f"#{tag}" if tag else ""
+def hashtag(value, prefix="", camel=False):
+    """«Старый Батуми» → #старыйбатуми, з camel=True і prefix="сдамквартиру" → #сдамквартируСтарыйБатуми."""
+    words = re.findall(r"[^\W_]+", clean(value))
+    if not words:
+        return ""
+    tag = "".join(w[:1].upper() + w[1:] for w in words) if camel else "".join(words).lower()
+    return f"#{prefix}{tag}"
+
+
+def layout(item):
+    """Планування в місцевому форматі: (кімнат, спалень, «1+1» або «студия»)."""
+    rooms, beds = to_int(clean(item.get("room"))), to_int(clean(item.get("bedroom")))
+    if rooms == 1 or beds == 0:
+        return rooms, beds, "студия"
+    if beds is None and rooms:
+        beds = rooms - 1
+    return rooms, beds, f"{beds}+1" if beds else ""
+
+
+def plan_values(item):
+    rooms, beds, plan = layout(item)
+    if plan == "студия":
+        return {"rooms_title": "квартира-студия", "plan": "студия (кухня-гостиная и спальная зона)",
+                "plan_tag": "#студия", "bedrooms_tag": ""}
+    if not plan:
+        return {"rooms_title": f"{rooms}-комнатная квартира" if rooms else "квартира",
+                "plan": "", "plan_tag": "", "bedrooms_tag": ""}
+    bed_words = "отдельная спальня" if beds == 1 else f"{beds} {plural(beds, 'спальня', 'спальни', 'спален')}"
+    return {"rooms_title": f"{rooms or beds + 1}-комнатная квартира ({plan})",
+            "plan": f"{plan} ({bed_words} + кухня-гостиная)",
+            "plan_tag": f"#{beds}плюс1",
+            "bedrooms_tag": f"#{beds}{plural(beds, 'спальня', 'спальни', 'спален')}"}
 
 
 def channel_values(item):
@@ -691,18 +721,27 @@ def channel_values(item):
     gel = as_dict(price.get("1")).get("price_total")
     usd = as_dict(price.get("2")).get("price_total")
     deal = DEAL_NAMES.get(to_int(item.get("deal_type_id")) or to_int(item.get("deal_type")), "")
+    floor, floors = clean(item.get("floor")), clean(item.get("total_floors"))
+    desc = description_text(item)
+    if CHANNEL_DESCRIPTION_MAX and len(desc) > CHANNEL_DESCRIPTION_MAX:
+        cut = desc[:CHANNEL_DESCRIPTION_MAX - 1]
+        cut = cut[:cut.rfind(" ")] if " " in cut[CHANNEL_DESCRIPTION_MAX // 2:] else cut
+        desc = cut.rstrip(" ,.;:\n") + "…"
     return {
+        **plan_values(item),
         "id": clean(item.get("id")),
         "title": clean(item.get("dynamic_title")),
         "price": price_text(item),
-        "price_usd": f"${fmt_num(usd)}" if usd else "",
+        "price_usd": f"{fmt_num(usd)}$" if usd else "",
         "price_gel": f"{fmt_num(gel)} ₾" if gel else "",
+        "price_main": f"{fmt_num(usd)}$" if usd else f"{fmt_num(gel)} ₾" if gel else "",
         "facts": facts_text(item),
         "area": fmt_area(item["area"]) if clean(item.get("area")) else "",
         "rooms": clean(item.get("room")),
         "bedrooms": clean(item.get("bedroom")),
-        "floor": clean(item.get("floor")),
-        "floors": clean(item.get("total_floors")),
+        "floor": floor,
+        "floors": floors,
+        "floor_full": f"{floor}/{floors}" if floor and floors else floor,
         "place": place_text(item),
         "city": clean(item.get("city_name")),
         "district": clean(item.get("urban_name")),
@@ -710,10 +749,12 @@ def channel_values(item):
         "deal": deal,
         "deal_tag": hashtag(deal),
         "district_tag": hashtag(item.get("urban_name")),
+        "district_rent_tag": hashtag(item.get("urban_name"), "сдамквартиру", camel=True),
+        "city_tag": hashtag(item.get("city_name")),
         "owner_phone": find_phone(item.get("user_phone_number"), item.get("additional_phone_number"),
                                   item.get("comment")),
         "link": listing_url(item),
-        "description": description_text(item),
+        "description": desc,
     }
 
 
@@ -733,9 +774,10 @@ def render_template(template, values):
         known = [n for n in names if n in values]
         if known and not any(values[n] for n in known):
             continue
-        out.append(PLACEHOLDER_RE.sub(
+        line = PLACEHOLDER_RE.sub(
             lambda m: html.escape(values[m.group(1)], quote=False) if m.group(1) in values else m.group(0),
-            line))
+            line)
+        out.append(re.sub(r"(?<=\S) {2,}", " ", line).rstrip() if known else line)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 

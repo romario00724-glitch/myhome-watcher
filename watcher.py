@@ -648,18 +648,86 @@ def channel_button(listing_id):
         {"text": "📢 Додати в канал", "callback_data": f"ch:{listing_id}"}]]}}
 
 
+def download_image(url):
+    """Завантажує фото з сайту (для випадків, коли Telegram не може взяти його за посиланням)."""
+    try:
+        if cffi_requests:
+            resp = cffi_requests.get(url, headers={"Referer": SITE + "/"}, impersonate="chrome", timeout=30)
+            status, body = resp.status_code, resp.content
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": SITE + "/"})
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
+                status, body = resp.status, resp.read()
+    except Exception as e:
+        log(f"  фото {url}: {e}")
+        return None
+    if status != 200 or not body or len(body) > 10 * 1024 * 1024:
+        log(f"  фото {url}: HTTP {status}, {len(body or b'')} байт")
+        return None
+    return body
+
+
+def tg_upload(method, fields, files):
+    """Запит до Telegram з файлами (multipart). files: {назва: (ім'я файлу, bytes)}."""
+    boundary = f"----myhome{random.getrandbits(64):x}"
+    parts = []
+    for name, value in fields.items():
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+                     f"{value}\r\n".encode("utf-8"))
+    for name, (filename, data) in files.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                     "Content-Type: image/jpeg\r\n\r\n".encode("utf-8") + data + b"\r\n")
+    body = b"".join(parts) + f"--{boundary}--\r\n".encode("utf-8")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    try:
+        if cffi_requests:
+            resp = cffi_requests.post(url, data=body, headers=headers, timeout=120)
+            text = resp.text
+        else:
+            req = urllib.request.Request(url, data=body, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=120, context=ssl_context()) as resp:
+                    text = resp.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                text = e.read().decode("utf-8", "replace")
+        return json.loads(text)
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+
+def send_photo(chat, urls, caption, extra=None):
+    """Фото з підписом: спершу за посиланням, інакше завантажує й шле файлом; пробує до 3 фото."""
+    result = {"ok": False, "description": "немає фото"}
+    for url in urls[:3]:
+        result = tg_call("sendPhoto", {"chat_id": chat, "photo": url, "caption": caption,
+                                       "parse_mode": "HTML", **(extra or {})})
+        if result.get("ok"):
+            return result
+        log(f"  sendPhoto за посиланням не вдався ({result.get('description')}) — шлю файлом")
+        data = download_image(url)
+        if data:
+            result = tg_upload("sendPhoto", {"chat_id": chat, "caption": caption, "parse_mode": "HTML",
+                                             **(extra or {})}, {"photo": ("photo.jpg", data)})
+            if result.get("ok"):
+                return result
+            log(f"  sendPhoto файлом не вдався: {result.get('description')}")
+    return result
+
+
 def send_listing(item, label, count):
     """Надсилає оголошення у всі чати. True, якщо дійшло хоча б в один."""
-    photo = main_image(item)
+    photos = image_urls(item)
     caption = build_message(item, label, count, max_len=1024)
     full_text = build_message(item, label, count)
     button = channel_button(item["id"])
+    if not photos:
+        log(f"  оголошення {item['id']}: на сайті немає фото")
     delivered = False
     for chat in chat_ids():
-        result = {"ok": False}
-        if photo:
-            result = tg_call("sendPhoto", {"chat_id": chat, "photo": photo, "caption": caption,
-                                           "parse_mode": "HTML", **button})
+        result = send_photo(chat, photos, caption, button) if photos else {"ok": False}
         if not result.get("ok"):  # фото не підійшло — шлемо текстом
             result = tg_call("sendMessage", {"chat_id": chat, "text": full_text,
                                              "parse_mode": "HTML", **button})
@@ -972,8 +1040,27 @@ def publish_post(chat_id, item, fallback_photo=""):
         if result.get("ok") and result.get("result"):
             return result["result"][0], ""
         errors.append(result.get("description"))
-    for photo in [p for p in (photos[:1] + [fallback_photo]) if p][:2]:
-        result = tg_call("sendPhoto", {"chat_id": chat_id, "photo": photo,
+        log(f"  альбом за посиланнями не вдався ({result.get('description')}) — шлю файлами")
+        files = {}
+        for url in photos:  # Telegram не взяв фото за посиланнями — завантажуємо самі
+            data = download_image(url) if url.startswith("http") else None
+            if data:
+                files[f"photo{len(files)}"] = (f"photo{len(files)}.jpg", data)
+        if len(files) > 1:
+            media = [{"type": "photo", "media": f"attach://{name}"} for name in files]
+            media[0].update(caption=caption, parse_mode="HTML")
+            result = tg_upload("sendMediaGroup", {"chat_id": chat_id, "media": media}, files)
+            if result.get("ok") and result.get("result"):
+                return result["result"][0], ""
+            errors.append(result.get("description"))
+    single = [p for p in photos if p.startswith("http")] or ([fallback_photo] if fallback_photo else [])
+    if single:
+        result = send_photo(chat_id, single, caption)
+        if result.get("ok"):
+            return result["result"], ""
+        errors.append(result.get("description"))
+    if fallback_photo and fallback_photo not in single:  # file_id фото з робочого чату
+        result = tg_call("sendPhoto", {"chat_id": chat_id, "photo": fallback_photo,
                                        "caption": caption, "parse_mode": "HTML"})
         if result.get("ok"):
             return result["result"], ""

@@ -1078,7 +1078,29 @@ def largest_photo(message):
     return max(sizes, key=lambda p: p.get("width", 0) * p.get("height", 0))["file_id"] if sizes else ""
 
 
-def post_to_channel(state, listing_id, fallback_photo=""):
+# Поля, які картка оголошення (для каналу) віддає не завжди, а видача пошуку — віддає.
+LIST_FACT_KEYS = ("room", "bedroom", "urban_name", "district_name", "city_name", "address",
+                  "area", "floor", "total_floors", "deal_type_id")
+
+
+def remember_facts(state, item, day):
+    """Запам'ятовує з видачі кімнати, спальні, район тощо — для поста в канал за кнопкою."""
+    facts = {k: item[k] for k in LIST_FACT_KEYS if clean(item.get(k))}
+    if facts:
+        state["facts"][str(item["id"])] = [day, facts]
+
+
+def facts_from_caption(text):
+    """Для оголошень, надісланих до remember_facts: кімнати й спальні з тексту повідомлення в чаті."""
+    facts = {}
+    for key, pattern in (("room", r"кімнат:\s*(\d+)"), ("bedroom", r"спалень:\s*(\d+)")):
+        match = re.search(pattern, str(text or ""))
+        if match:
+            facts[key] = match.group(1)
+    return facts
+
+
+def post_to_channel(state, listing_id, fallback_photo="", caption=""):
     """Публікує оголошення в канал. Повертає (посилання на пост або "", помилка або "", помилка ШІ або "")."""
     key = str(listing_id)
     if key in state["posted"]:
@@ -1087,6 +1109,10 @@ def post_to_channel(state, listing_id, fallback_photo=""):
         item = fetch_listing(listing_id)
     except FetchError as e:
         return "", f"myhome.ge: {e}", ""
+    known = state["facts"].get(key, [None, {}])[1] or facts_from_caption(caption)
+    for k, v in known.items():
+        if not clean(item.get(k)):
+            item[k] = v
     message, error = publish_post(TELEGRAM_CHANNEL_ID, item, fallback_photo)
     if not message:
         return "", f"Telegram: {error}", ""
@@ -1107,7 +1133,8 @@ def handle_callback(state, query):
     if not TELEGRAM_CHANNEL_ID:
         link, error, ai_error = "", "канал не налаштований (TELEGRAM_CHANNEL_ID)", ""
     else:
-        link, error, ai_error = post_to_channel(state, listing_id, largest_photo(chat_msg))
+        link, error, ai_error = post_to_channel(state, listing_id, largest_photo(chat_msg),
+                                                chat_msg.get("caption") or chat_msg.get("text") or "")
     tg_call("answerCallbackQuery", {"callback_query_id": query.get("id"),
                                     "text": "❌ Не вдалося, деталі в чаті" if error else "✅ Опубліковано в каналі"})
     if error:
@@ -1156,7 +1183,7 @@ def process_updates(state, wait=0):
 
 def new_state():
     return {"version": 1, "searches": {}, "seen": {}, "authors": {}, "fail_streak": 0,
-            "tg_offset": 0, "posted": {}}
+            "tg_offset": 0, "posted": {}, "facts": {}}
 
 
 def load_state():
@@ -1177,6 +1204,7 @@ def save_state(state):
     state["seen"] = {day: sorted(set(ids)) for day, ids in state["seen"].items() if day >= cutoff}
     state["authors"] = {k: v for k, v in state["authors"].items() if v[1] >= cutoff}
     state["posted"] = {k: v for k, v in state["posted"].items() if v[1] >= cutoff}
+    state["facts"] = {k: v for k, v in state["facts"].items() if v[0] >= cutoff}
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True, indent=0), encoding="utf-8")
     tmp.replace(STATE_FILE)
@@ -1286,6 +1314,7 @@ def run_once(state):
             print_listing(item, label, count)
             delivered = True
         if delivered:  # не дійшло — спробуємо наступного запуску
+            remember_facts(state, item, day)
             mark_seen(state, item["id"], day)
             register_author(state, item, day)
             sent += 1

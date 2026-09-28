@@ -1310,7 +1310,12 @@
 ]
 },
 "fail_streak": 0,
-"posted": {},
+"posted": {
+"26129224": [
+"https://t.me/arendabatumi3/458",
+"2026-09-28"
+]
+},
 "searches": {
 "cities=15&currency_id=1&deal_types=2&owner_type=physical&real_estate_types=1": "2026-09-27"
 },
@@ -1623,6 +1628,6 @@
 26187610
 ]
 },
-"tg_offset": 117274826,
+"tg_offset": 117274827,
 "version": 1
 }

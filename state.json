@@ -1302,6 +1302,7 @@
 ]
 },
 "fail_streak": 0,
+"posted": {},
 "searches": {
 "cities=15&currency_id=1&deal_types=2&owner_type=physical&real_estate_types=1": "2026-09-27"
 },
@@ -1612,5 +1613,6 @@
 26187570
 ]
 },
+"tg_offset": 117274826,
 "version": 1
 }

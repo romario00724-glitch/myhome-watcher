@@ -114,7 +114,7 @@ load_telegram_file()
 
 def normalize_channel(value):
     """«https://t.me/arendabatumi3», «t.me/arendabatumi3», «arendabatumi3» → «@arendabatumi3»; -100... лишається."""
-    value = clean(value)
+    value = str(value or "").strip()
     match = re.fullmatch(r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})/?", value)
     if match:
         return "@" + match.group(1)

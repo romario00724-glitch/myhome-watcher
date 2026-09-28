@@ -38,6 +38,8 @@ from pathlib import Path
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # кілька чатів — через кому
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")  # канал для кнопки «Додати в канал»: @назва або -100...
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # якщо задано — текст поста для каналу допише ШІ
+OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-5-mini"
 
 LANG = "ru"                    # мова назв і посилань з myhome.ge: ru / en / ka
 ONLY_OWNERS = True             # завжди додавати фільтр «Власник» (owner_type=physical)
@@ -93,7 +95,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 def load_telegram_file():
     """Доповнює токен, chat_id і канал з telegram.json, якщо їх не задано змінними середовища."""
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_CHANNEL_ID, OPENAI_API_KEY
     if not TELEGRAM_FILE.exists():
         return
     try:
@@ -104,6 +106,7 @@ def load_telegram_file():
     TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or str(cfg.get("token") or "").strip()
     TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID or str(cfg.get("chat_id") or "").strip()
     TELEGRAM_CHANNEL_ID = TELEGRAM_CHANNEL_ID or str(cfg.get("channel_id") or "").strip()
+    OPENAI_API_KEY = OPENAI_API_KEY or str(cfg.get("openai_key") or "").strip()
 
 
 load_telegram_file()
@@ -322,6 +325,9 @@ def fetch_listing(listing_id):
 # ─────────────────────────── аналіз оголошення ───────────────────────────
 
 PHONE_RE = re.compile(r"(?<![\d+])(?:\+?995[\s\-.]?)?(5\d{2}(?:[\s\-.]?\d){6})(?!\d)")
+PHONE_WITH_LABEL_RE = re.compile(  # «Тел.: 599 12 34 56», «звоните 599123456» — прибирається цілком
+    r"(?i)(?:\b(?:тел(?:ефон)?|моб(?:ильный)?|звоните|пишите|whats\s?app|viber|telegram|phone|tel|"
+    r"вотсап|ватсап|вайбер|ტელ(?:ეფონი)?)\b\.?[\s:.\-–—]*(?:по\s+)?)?" + PHONE_RE.pattern)
 
 
 def find_phone(*texts):
@@ -577,15 +583,15 @@ def telegram_ready():
     return bool(TELEGRAM_BOT_TOKEN and chat_ids())
 
 
-def _post_json(url, payload):
+def _post_json(url, payload, headers=None, timeout=30):
     """POST з JSON → (код, текст відповіді). Спершу через curl_cffi, інакше — urllib."""
     if cffi_requests:
-        resp = cffi_requests.post(url, json=payload, timeout=30)
+        resp = cffi_requests.post(url, json=payload, headers=headers, timeout=timeout)
         return resp.status_code, resp.text
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **(headers or {})})
     try:
-        with urllib.request.urlopen(req, timeout=30, context=ssl_context()) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
@@ -672,7 +678,7 @@ def description_text(item):
     lines = []
     for line in text.splitlines():
         if CHANNEL_HIDE_PHONES and PHONE_RE.search(line):
-            line = PHONE_RE.sub("", line)
+            line = re.sub(r"\s+([.,;!?])", r"\1", PHONE_WITH_LABEL_RE.sub("", line))
             if len(re.sub(r"\W", "", line)) < 20:  # лишилось щось на кшталт «Тел.:» — рядок геть
                 continue
         line = re.sub(r"[ \t]+", " ", line).strip()
@@ -727,8 +733,17 @@ def channel_values(item):
         cut = desc[:CHANNEL_DESCRIPTION_MAX - 1]
         cut = cut[:cut.rfind(" ")] if " " in cut[CHANNEL_DESCRIPTION_MAX // 2:] else cut
         desc = cut.rstrip(" ,.;:\n") + "…"
+    plan = plan_values(item)
+    ai = as_dict(item.get("_ai"))
+    district = clean(item.get("urban_name"))
+    headline = ai.get("headline") or " ".join(
+        x for x in ("Уютная", plan["rooms_title"] + ("," if district else ""), district) if x)
+    points = [f"✔️ {p}" for p in ai.get("points") or []] or ([f"✔️ {desc}"] if desc else [])
     return {
-        **plan_values(item),
+        **plan,
+        "headline": headline,
+        "points": "\n".join(points),
+        "terms": ai.get("terms") or "",
         "id": clean(item.get("id")),
         "title": clean(item.get("dynamic_title")),
         "price": price_text(item),
@@ -758,6 +773,79 @@ def channel_values(item):
     }
 
 
+AI_PROMPT = """Ты помогаешь вести Telegram-канал «Аренда Батуми» с объявлениями об аренде квартир.
+По данным объявления с myhome.ge подготовь части поста на русском языке.
+
+Верни JSON:
+{"headline": "...", "points": ["...", "..."], "terms": "..."}
+
+headline — одна строка вида «Уютная 2-комнатная квартира (1+1) в Квариати»: прилагательное
+(уютная, светлая, просторная, современная — по описанию), тип квартиры и район с правильным
+падежом («в Старом Батуми», «на Новом бульваре», «в районе Аэропорта»). Без эмодзи.
+
+points — 2–4 коротких пункта «Название: значение», только то, что реально есть в описании:
+Срок, Состояние, Мебель и техника, Дом, Вид, Парковка, Животные, Особенности и т.п.
+Не повторяй планировку, площадь, этаж, цену и адрес — они уже есть в посте.
+Пример: «Срок: Аренда на 9 месяцев (до летнего сезона)», «Состояние: Новый ремонт, всё необходимое для проживания».
+
+terms — условия оплаты и договора в скобках, если они есть в описании, например
+«(договор, оплата за первый и последний месяцы)». Если не указаны — пустая строка.
+
+Правила: ничего не выдумывай — если чего-то нет в данных, не пиши об этом. Не упоминай
+собственника, агентства, комиссию, телефоны, имена и ссылки. Если описание на грузинском
+или английском — переведи. Весь ответ вместе — не длиннее 400 символов."""
+
+
+def ai_parts(item):
+    """Просить OpenAI дописати заголовок, пункти й умови. Повертає dict або кидає FetchError."""
+    facts = {
+        "тип": plan_values(item)["rooms_title"], "планировка": plan_values(item)["plan"],
+        "площадь_м2": fmt_area(item["area"]) if clean(item.get("area")) else "",
+        "этаж": clean(item.get("floor")), "этажей_в_доме": clean(item.get("total_floors")),
+        "город": clean(item.get("city_name")), "район": clean(item.get("urban_name")),
+        "адрес": clean(item.get("address")), "заголовок_на_сайте": clean(item.get("dynamic_title")),
+        "цена": price_text(item), "описание": description_text(item),
+    }
+    payload = {"model": OPENAI_MODEL, "response_format": {"type": "json_object"},
+               "max_completion_tokens": 4000,
+               "messages": [{"role": "system", "content": AI_PROMPT},
+                            {"role": "user", "content": json.dumps(facts, ensure_ascii=False)}]}
+    try:
+        status, body = _post_json("https://api.openai.com/v1/chat/completions", payload,
+                                  {"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=120)
+    except Exception as e:
+        raise FetchError(f"мережева помилка: {e}") from e
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise FetchError(f"HTTP {status}")
+    if status != 200:
+        raise FetchError(clean(as_dict(data.get("error")).get("message")) or f"HTTP {status}")
+    try:
+        parts = json.loads(data["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise FetchError("відповідь не в очікуваному форматі")
+    points = parts.get("points") if isinstance(parts.get("points"), list) else []
+    points = [clean(p).lstrip("✔️-•· ").strip() for p in points if clean(p)]
+    while len("".join(points)) > 450:  # щоб пост влазив у підпис до фото
+        points.pop()
+    terms = clean(parts.get("terms"))
+    if terms and not terms.startswith("("):
+        terms = f"({terms.strip('()')})"
+    return {"headline": clean(parts.get("headline")).rstrip("."), "points": points, "terms": terms}
+
+
+def add_ai_parts(item):
+    """Один раз на оголошення дописує item["_ai"]; помилку кладе в item["_ai_error"]."""
+    if not OPENAI_API_KEY or "_ai" in item or "_ai_error" in item:
+        return
+    try:
+        item["_ai"] = ai_parts(item)
+    except FetchError as e:
+        item["_ai_error"] = str(e)
+        log(f"OpenAI, оголошення {item.get('id')}: {e}")
+
+
 def load_channel_template():
     if CHANNEL_TEMPLATE_FILE.exists():
         text = CHANNEL_TEMPLATE_FILE.read_text(encoding="utf-8").strip()
@@ -778,7 +866,9 @@ def render_template(template, values):
             lambda m: html.escape(values[m.group(1)], quote=False) if m.group(1) in values else m.group(0),
             line)
         out.append(re.sub(r"(?<=\S) {2,}", " ", line).rstrip() if known else line)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    text = re.sub(r"<(b|i|u|s)>\s*</\1>", "", "\n".join(out))  # порожні <i></i> від порожніх {назв}
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def build_channel_post(item, max_len=1024):
@@ -811,6 +901,7 @@ def message_link(message):
 
 def publish_post(chat_id, item, fallback_photo=""):
     """Шле альбом із підписом (або одне фото, або текст). Повертає (перше повідомлення, помилка)."""
+    add_ai_parts(item)
     caption = build_channel_post(item, 1024)
     photos = image_urls(item)[:CHANNEL_MAX_PHOTOS] or ([fallback_photo] if fallback_photo else [])
     errors = []
@@ -841,21 +932,21 @@ def largest_photo(message):
 
 
 def post_to_channel(state, listing_id, fallback_photo=""):
-    """Публікує оголошення в канал. Повертає (посилання на пост або "", помилка або "")."""
+    """Публікує оголошення в канал. Повертає (посилання на пост або "", помилка або "", помилка ШІ або "")."""
     key = str(listing_id)
     if key in state["posted"]:
-        return state["posted"][key][0], ""
+        return state["posted"][key][0], "", ""
     try:
         item = fetch_listing(listing_id)
     except FetchError as e:
-        return "", f"myhome.ge: {e}"
+        return "", f"myhome.ge: {e}", ""
     message, error = publish_post(TELEGRAM_CHANNEL_ID, item, fallback_photo)
     if not message:
-        return "", f"Telegram: {error}"
+        return "", f"Telegram: {error}", ""
     link = message_link(message)
     state["posted"][key] = [link, today()]
     log(f"оголошення {listing_id} опубліковано в канал {link}")
-    return link, ""
+    return link, "", item.get("_ai_error", "")
 
 
 def handle_callback(state, query):
@@ -867,9 +958,9 @@ def handle_callback(state, query):
         return
     listing_id = int(data[3:])
     if not TELEGRAM_CHANNEL_ID:
-        link, error = "", "канал не налаштований (TELEGRAM_CHANNEL_ID)"
+        link, error, ai_error = "", "канал не налаштований (TELEGRAM_CHANNEL_ID)", ""
     else:
-        link, error = post_to_channel(state, listing_id, largest_photo(chat_msg))
+        link, error, ai_error = post_to_channel(state, listing_id, largest_photo(chat_msg))
     tg_call("answerCallbackQuery", {"callback_query_id": query.get("id"),
                                     "text": "❌ Не вдалося, деталі в чаті" if error else "✅ Опубліковано в каналі"})
     if error:
@@ -881,6 +972,13 @@ def handle_callback(state, query):
                                 "reply_parameters": {"message_id": chat_msg.get("message_id"),
                                                      "allow_sending_without_reply": True}})
         return
+    if ai_error:
+        tg_call("sendMessage", {"chat_id": chat_id,
+                                "text": f"⚠️ OpenAI не відповів ({html.escape(ai_error)}), тому пост "
+                                        "зібрано за звичайним шаблоном — за потреби підправте його в каналі.",
+                                "parse_mode": "HTML",
+                                "reply_parameters": {"message_id": chat_msg.get("message_id"),
+                                                     "allow_sending_without_reply": True}})
     done = {"text": "✅ В каналі", "url": link} if link else {"text": "✅ В каналі", "callback_data": data}
     tg_call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": chat_msg.get("message_id"),
                                        "reply_markup": {"inline_keyboard": [[done]]}})
@@ -1087,7 +1185,7 @@ def cmd_post(listing_id):
         raise ConfigError("спершу вкажіть TELEGRAM_BOT_TOKEN і TELEGRAM_CHANNEL_ID")
     state = load_state()
     try:
-        link, error = post_to_channel(state, listing_id)
+        link, error, _ = post_to_channel(state, listing_id)
     finally:
         save_state(state)
     log(f"Опубліковано: {link or '✅'}" if not error else f"Не вдалося: {error}")

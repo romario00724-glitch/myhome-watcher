@@ -55,6 +55,8 @@ KEEP_DAYS = 60                 # скільки днів пам'ятати по�
 CHANNEL_MAX_PHOTOS = 10        # скільки фото брати в пост каналу (Telegram дозволяє до 10)
 CHANNEL_HIDE_PHONES = True     # прибирати телефони власника з опису в каналі
 CHANNEL_DESCRIPTION_MAX = 350  # скільки символів опису власника брати в пост (0 — весь, скільки влізе)
+TRANSLATE_ALERTS = True        # з OPENAI_API_KEY: перекладати російською грузинські/англійські опис і адресу в чаті
+TRANSLATE_BUDGET_SECONDS = 180 # не більше стільки секунд на переклади за одну перевірку (запобіжник для GitHub)
 # ──────────────────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -475,10 +477,6 @@ def facts_text(item):
     return " · ".join(facts)
 
 
-def place_text(item):
-    return ", ".join(p for p in (clean(item.get("urban_name")), clean(item.get("address"))) if p)
-
-
 def listing_time(item):
     """«25.09 02:01», а якщо оголошення потім піднімали — «25.09 02:01, оновлено 27.09 14:03»."""
     created = _parse_time(item.get("created_at") or item.get("create_date"))
@@ -537,7 +535,8 @@ def build_message(item, label, count, max_len=4096):
     if facts:
         lines.append("📐 " + facts)
 
-    place = place_text(item)
+    place = ", ".join(p for p in (clean(item.get("urban_name")),
+                                  item.get("_ru_address") or clean(item.get("address"))) if p)
     if place:
         lines.append(f"📍 {esc(place)}")
 
@@ -573,7 +572,7 @@ def build_message(item, label, count, max_len=4096):
 
     link = f'🔗 <a href="{html.escape(listing_url(item))}">Відкрити на myhome.ge</a>'
     message = "\n".join(lines)
-    desc = plain_text(item.get("comment"))
+    desc = item.get("_ru_comment") or plain_text(item.get("comment"))
     budget = min(400, max_len - visible_len(message) - visible_len(link) - 10)
     if desc and budget > 40:
         snippet = desc if len(desc) <= budget else desc[:budget - 1].rstrip() + "…"
@@ -753,6 +752,8 @@ def channel_values(item):
     headline = ai.get("headline") or " ".join(
         x for x in ("Уютная", plan["rooms_title"] + ("," if district else ""), district) if x)
     points = [f"✔️ {p}" for p in ai.get("points") or []] or ([f"✔️ {desc}"] if desc else [])
+    address = ai.get("address") or clean(item.get("address"))
+    place = ", ".join(p for p in (district, address) if p)
     return {
         **plan,
         "headline": headline,
@@ -771,10 +772,10 @@ def channel_values(item):
         "floor": floor,
         "floors": floors,
         "floor_full": f"{floor}/{floors}" if floor and floors else floor,
-        "place": place_text(item),
+        "place": place,
         "city": clean(item.get("city_name")),
         "district": clean(item.get("urban_name")),
-        "address": clean(item.get("address")),
+        "address": address,
         "deal": deal,
         "deal_tag": hashtag(deal),
         "district_tag": hashtag(item.get("urban_name")),
@@ -791,7 +792,7 @@ AI_PROMPT = """Ты помогаешь вести Telegram-канал «Арен
 По данным объявления с myhome.ge подготовь части поста на русском языке.
 
 Верни JSON:
-{"headline": "...", "points": ["...", "..."], "terms": "..."}
+{"headline": "...", "points": ["...", "..."], "terms": "...", "address": "..."}
 
 headline — одна строка вида «Уютная 2-комнатная квартира (1+1) в Квариати»: прилагательное
 (уютная, светлая, просторная, современная — по описанию), тип квартиры и район с правильным
@@ -804,6 +805,9 @@ points — 2–4 коротких пункта «Название: значен�
 
 terms — условия оплаты и договора в скобках, если они есть в описании, например
 «(договор, оплата за первый и последний месяцы)». Если не указаны — пустая строка.
+
+address — адрес по-русски: грузинский переведи («რუსთაველის ქ. 15» → «ул. Руставели 15»),
+русский оставь как есть; если адреса нет — пустая строка.
 
 Правила: ничего не выдумывай — если чего-то нет в данных, не пиши об этом. Не упоминай
 собственника, агентства, комиссию, телефоны, имена и ссылки. Если описание на грузинском
@@ -820,10 +824,24 @@ def ai_parts(item):
         "адрес": clean(item.get("address")), "заголовок_на_сайте": clean(item.get("dynamic_title")),
         "цена": price_text(item), "описание": description_text(item),
     }
+    parts = openai_json(AI_PROMPT, facts)
+    points = parts.get("points") if isinstance(parts.get("points"), list) else []
+    points = [clean(p).lstrip("✔️-•· ").strip() for p in points if clean(p)]
+    while len("".join(points)) > 450:  # щоб пост влазив у підпис до фото
+        points.pop()
+    terms = clean(parts.get("terms"))
+    if terms and not terms.startswith("("):
+        terms = f"({terms.strip('()')})"
+    return {"headline": clean(parts.get("headline")).rstrip("."), "points": points, "terms": terms,
+            "address": clean(parts.get("address"))}
+
+
+def openai_json(system, data):
+    """Запит до OpenAI з відповіддю-JSON. Повертає dict або кидає FetchError."""
     payload = {"model": OPENAI_MODEL, "response_format": {"type": "json_object"},
                "max_completion_tokens": 4000,
-               "messages": [{"role": "system", "content": AI_PROMPT},
-                            {"role": "user", "content": json.dumps(facts, ensure_ascii=False)}]}
+               "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]}
     try:
         status, body = _post_json("https://api.openai.com/v1/chat/completions", payload,
                                   {"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=120)
@@ -839,14 +857,42 @@ def ai_parts(item):
         parts = json.loads(data["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError, ValueError):
         raise FetchError("відповідь не в очікуваному форматі")
-    points = parts.get("points") if isinstance(parts.get("points"), list) else []
-    points = [clean(p).lstrip("✔️-•· ").strip() for p in points if clean(p)]
-    while len("".join(points)) > 450:  # щоб пост влазив у підпис до фото
-        points.pop()
-    terms = clean(parts.get("terms"))
-    if terms and not terms.startswith("("):
-        terms = f"({terms.strip('()')})"
-    return {"headline": clean(parts.get("headline")).rstrip("."), "points": points, "terms": terms}
+    if not isinstance(parts, dict):
+        raise FetchError("відповідь не в очікуваному форматі")
+    return parts
+
+
+TRANSLATE_PROMPT = """Переведи на русский язык описание и адрес объявления об аренде квартиры в Батуми.
+Верни JSON: {"description": "...", "address": "..."}.
+Переводи точно, ничего не добавляй и не сокращай, эмодзи оставь. Названия улиц передавай
+по-русски: «რუსთაველის ქ. 15» → «ул. Руставели 15», «ჭავჭავაძის ქ.» → «ул. Чавчавадзе».
+Если поле пустое или уже на русском — верни его как есть."""
+
+
+def needs_translation(text):
+    """Грузинські літери або латиниці більше, ніж кирилиці."""
+    text = str(text or "")
+    if re.search(r"[\u10A0-\u10FF]", text):
+        return True
+    latin = len(re.findall(r"[A-Za-z]", text))
+    return latin > 20 and latin > len(re.findall(r"[А-Яа-яЁёІіЇїЄє]", text))
+
+
+def translate_listing(item):
+    """Перекладає опис і адресу для повідомлення в чаті (item["_ru_comment"], item["_ru_address"])."""
+    desc, address = plain_text(item.get("comment"))[:1500], clean(item.get("address"))
+    if not (needs_translation(desc) or needs_translation(address)):
+        return False
+    try:
+        parts = openai_json(TRANSLATE_PROMPT, {"description": desc, "address": address})
+    except FetchError as e:
+        log(f"  переклад {item['id']}: {e}")
+        return True
+    if clean(parts.get("description")):
+        item["_ru_comment"] = clean(parts["description"])
+    if clean(parts.get("address")):
+        item["_ru_address"] = clean(parts["address"])
+    return True
 
 
 def add_ai_parts(item):
@@ -1135,11 +1181,13 @@ def run_once(state):
         candidates = candidates[:MAX_ALERTS_PER_RUN]
     candidates.reverse()  # у чаті йдуть від старших до новіших
 
-    sent = 0
+    sent, translate_deadline = 0, time.time() + TRANSLATE_BUDGET_SECONDS
     for label, item in candidates:
         if FETCH_DETAILS:
             enrich_with_details(item)
             time.sleep(random.uniform(0.5, 1.2))
+        if OPENAI_API_KEY and TRANSLATE_ALERTS and time.time() < translate_deadline:
+            translate_listing(item)
         count = author_count(state, item)
         suspect = max(count, item.get("_site_count") or 0)
         if SKIP_SUSPECTED_AGENTS and suspect >= AGENT_THRESHOLD:

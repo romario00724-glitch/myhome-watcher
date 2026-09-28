@@ -1,0 +1,9 @@
+🏠 <b>{title}</b>
+
+💰 {price}
+📐 {facts}
+📍 {place}
+
+{description}
+
+{deal_tag} {district_tag}

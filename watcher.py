@@ -1127,6 +1127,9 @@ def handle_callback(state, query):
     chat_id = str(as_dict(chat_msg.get("chat")).get("id", ""))
     data = str(query.get("data") or "")
     if chat_id not in chat_ids() or not re.fullmatch(r"ch:\d+", data):
+        log(f"кнопка «{data}» з чату {chat_id} пропущена: цього чату немає в TELEGRAM_CHAT_ID "
+            "(якщо група стала супергрупою, в неї новий id -100...)" if chat_id not in chat_ids()
+            else f"кнопка «{data}» з чату {chat_id} пропущена: невідома кнопка")
         tg_call("answerCallbackQuery", {"callback_query_id": query.get("id")})
         return
     listing_id = int(data[3:])
@@ -1169,7 +1172,15 @@ def process_updates(state, wait=0):
     if not result.get("ok"):
         log(f"Telegram getUpdates: {result.get('description')}")
         return
-    for update in result.get("result", []):
+    updates = result.get("result") or []
+    if updates:
+        log(f"кнопки: отримано оновлень від Telegram — {len(updates)}")
+    elif not wait:  # діагностика: чи не лежать натискання там, де ми їх не бачимо
+        info = as_dict(tg_call("getWebhookInfo", {}).get("result"))
+        if info.get("url") or info.get("pending_update_count") or info.get("last_error_message"):
+            log(f"кнопки: Telegram нічого не віддав; webhook={'є' if info.get('url') else 'немає'}, "
+                f"в черзі={info.get('pending_update_count')}, помилка={info.get('last_error_message') or '—'}")
+    for update in updates:
         state["tg_offset"] = int(update["update_id"]) + 1
         query = as_dict(update.get("callback_query"))
         if query:

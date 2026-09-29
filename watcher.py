@@ -5,6 +5,7 @@ myhome.ge -> Telegram: нові оголошення від власників.
 Команди:
   python watcher.py             перевіряти безперервно (кожні LOOP_MINUTES хв)
   python watcher.py --once      одна перевірка (для GitHub Actions / cron)
+  python watcher.py --once --listen 600   перевірка, а потім до кінця 10-хвилинного слоту слухати кнопки
   python watcher.py --test      показати 3 свіжі оголошення й надіслати одне тестове в Telegram
   python watcher.py --chat-id   дізнатися chat_id (спершу напишіть боту /start)
   python watcher.py --reset     забути базу й наступного разу заново «запам'ятати» поточні оголошення
@@ -50,6 +51,8 @@ AGENT_THRESHOLD = 3            # від скількох оголошень в �
 SKIP_SUSPECTED_AGENTS = False  # True — такі оголошення взагалі не надсилати
 MAX_ALERTS_PER_RUN = 25        # запобіжник від спаму; решта прийде наступного запуску
 LOOP_MINUTES = 10              # інтервал у безперервному режимі
+LISTEN_SLOT_SECONDS = 600      # з --listen: слухати кнопки до кінця цього слоту (запуски на GitHub — кожні 10 хв)
+LISTEN_MARGIN_SECONDS = 25     # ...і завершитися за стільки секунд до наступного запуску
 FAIL_ALERT_AFTER = 6           # після скількох невдалих перевірок поспіль написати в Telegram
 KEEP_DAYS = 60                 # скільки днів пам'ятати побачені оголошення
 CHANNEL_MAX_PHOTOS = 10        # скільки фото брати в пост каналу (Telegram дозволяє до 10)
@@ -1133,15 +1136,21 @@ def handle_callback(state, query):
         tg_call("answerCallbackQuery", {"callback_query_id": query.get("id")})
         return
     listing_id = int(data[3:])
+    message_ref = {"chat_id": chat_id, "message_id": chat_msg.get("message_id")}
+    already = str(listing_id) in state["posted"]
+    tg_call("answerCallbackQuery", {"callback_query_id": query.get("id"),
+                                    "text": "✅ Уже в каналі" if already else "⏳ Публікую в канал…"})
+    if not already:  # одразу показуємо, що натискання прийняте
+        tg_call("editMessageReplyMarkup", {**message_ref, "reply_markup": {"inline_keyboard": [[
+            {"text": "⏳ Публікую…", "callback_data": data}]]}})
     if not TELEGRAM_CHANNEL_ID:
         link, error, ai_error = "", "канал не налаштований (TELEGRAM_CHANNEL_ID)", ""
     else:
         link, error, ai_error = post_to_channel(state, listing_id, largest_photo(chat_msg),
                                                 chat_msg.get("caption") or chat_msg.get("text") or "")
-    tg_call("answerCallbackQuery", {"callback_query_id": query.get("id"),
-                                    "text": "❌ Не вдалося, деталі в чаті" if error else "✅ Опубліковано в каналі"})
     if error:
         log(f"канал, оголошення {listing_id}: {error}")
+        tg_call("editMessageReplyMarkup", {**message_ref, **channel_button(listing_id)})  # можна натиснути ще раз
         tg_call("sendMessage", {"chat_id": chat_id,
                                 "text": f"❌ Не вдалося опублікувати в канал: {html.escape(error)}\n"
                                         "Натисніть кнопку ще раз, коли виправите.",
@@ -1157,8 +1166,7 @@ def handle_callback(state, query):
                                 "reply_parameters": {"message_id": chat_msg.get("message_id"),
                                                      "allow_sending_without_reply": True}})
     done = {"text": "✅ В каналі", "url": link} if link else {"text": "✅ В каналі", "callback_data": data}
-    tg_call("editMessageReplyMarkup", {"chat_id": chat_id, "message_id": chat_msg.get("message_id"),
-                                       "reply_markup": {"inline_keyboard": [[done]]}})
+    tg_call("editMessageReplyMarkup", {**message_ref, "reply_markup": {"inline_keyboard": [[done]]}})
 
 
 def process_updates(state, wait=0):
@@ -1332,11 +1340,23 @@ def run_once(state):
     log(f"оброблено нових оголошень: {sent} з {len(candidates)}")
 
 
-def cmd_once():
+def cmd_once(listen=0):
+    """Одна перевірка. listen > 0 — потім слухати кнопки до кінця 10-хвилинного слоту (не довше listen с).
+
+    Telegram тримає натискання кнопки недовго, тож бот, що прокидається раз на 10 хвилин,
+    їх губить. Тому на GitHub кожен запуск після перевірки слухає кнопки майже до наступного.
+    """
+    started = time.time()
     state = load_state()
     try:
-        process_updates(state)  # спершу — натискання «Додати в канал» з минулих разів
+        process_updates(state)  # спершу — натискання «Додати в канал», що вже чекають
         run_once(state)
+        slot_end = started - started % LISTEN_SLOT_SECONDS + LISTEN_SLOT_SECONDS - LISTEN_MARGIN_SECONDS
+        deadline = min(started + listen, slot_end)
+        if listen and TELEGRAM_CHANNEL_ID and time.time() < deadline:
+            log(f"слухаю кнопки до {datetime.fromtimestamp(deadline, GEORGIA_TZ):%H:%M:%S}")
+            while time.time() < deadline - 1:
+                process_updates(state, wait=int(min(50, max(1, deadline - time.time()))))
     finally:
         save_state(state)
     return 0
@@ -1486,6 +1506,8 @@ def main():
     parser = argparse.ArgumentParser(description="myhome.ge -> Telegram: нові оголошення від власників")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--once", action="store_true", help="одна перевірка і вихід")
+    parser.add_argument("--listen", type=int, default=0, metavar="SEC",
+                        help="з --once: після перевірки слухати кнопки до кінця 10-хвилинного слоту (не довше SEC)")
     group.add_argument("--test", action="store_true", help="тестовий прогін")
     group.add_argument("--chat-id", action="store_true", help="показати chat_id з повідомлень боту")
     group.add_argument("--reset", action="store_true", help="забути базу побачених оголошень")
@@ -1507,7 +1529,7 @@ def main():
         if args.post:
             return cmd_post(args.post)
         if args.once:
-            return cmd_once()
+            return cmd_once(args.listen)
         return cmd_loop()
     except ConfigError as e:
         log(f"Помилка налаштувань: {e}")

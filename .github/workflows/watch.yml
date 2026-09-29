@@ -15,9 +15,11 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15        # перевірка + прослуховування кнопок до кінця 10-хвилинного слоту
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}   # свіжий state.json, а не той, що був, коли запуск став у чергу
 
       - uses: actions/setup-python@v6
         with:
@@ -33,7 +35,7 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
-        run: python watcher.py --once
+        run: python watcher.py --once --listen 600
 
       - name: Save state.json
         if: always()

@@ -44,6 +44,7 @@ SEED_PAGES = 10                # скільки сторінок «запам'я
 FETCH_DETAILS = True           # догружати картку нового оголошення (телефон, автор)
 AGENT_THRESHOLD = 3            # від скількох оголошень в одного автора ставити позначку ⚠️
 SKIP_SUSPECTED_AGENTS = False  # True — такі оголошення взагалі не надсилати
+SKIP_SITE_AGENTS = True        # сайт сам позначив автора «Агент» — не надсилати (False — надсилати з ⚠️)
 MAX_ALERTS_PER_RUN = 25        # запобіжник від спаму; решта прийде наступного запуску
 LOOP_MINUTES = 10              # інтервал у безперервному режимі
 FAIL_ALERT_AFTER = 6           # після скількох невдалих перевірок поспіль написати в Telegram
@@ -278,6 +279,16 @@ def find_author_listing_count(data):
     return None, None
 
 
+def site_user_type(item):
+    """Хто автор за версією сайту: "physical" (власник), "agent"… або "" — невідомо."""
+    return clean(as_dict(item.get("user_type")).get("type")).lower()
+
+
+def is_site_agent(item):
+    """Сайт показує біля автора плашку «Агент» (чи інший тип, не «власник»)."""
+    return site_user_type(item) not in ("", "physical")
+
+
 def apply_author_listing_count(item, data):
     number, field = find_author_listing_count(data)
     if number is not None:
@@ -293,6 +304,8 @@ def enrich_with_details(item):
         log(f"  картка {item['id']}: {e}")
         return item
     detail = as_dict(as_dict(as_dict(data).get("data")).get("statement"))
+    if site_user_type(detail):  # картка свіжіша за видачу: у видачі автор ще міг бути «власником»
+        item["user_type"] = detail["user_type"]
     if "_site_count" not in item:
         apply_author_listing_count(item, detail)
     for key in DETAIL_FIELDS:
@@ -519,6 +532,8 @@ def build_message(item, label, count, max_len=4096):
     lines.append(" · ".join(x for x in (f"🕒 {when}" if when else "", f"🔎 {esc(label)}") if x))
 
     agent_text, owner_text = text_signals(plain_text(item.get("comment")))
+    if is_site_agent(item):
+        lines.append("⚠️ На myhome.ge автор позначений як агент")
     site = item.get("_site_count")
     if isinstance(site, int):
         words = plural(site, "оголошення", "оголошення", "оголошень")
@@ -876,18 +891,22 @@ def run_once(state):
         if FETCH_DETAILS:
             enrich_with_details(item)
             time.sleep(random.uniform(0.5, 1.2))
-        if OPENAI_API_KEY and TRANSLATE_ALERTS and time.time() < translate_deadline:
-            translate_listing(item)
         count = author_count(state, item)
         suspect = max(count, item.get("_site_count") or 0)
-        if SKIP_SUSPECTED_AGENTS and suspect >= AGENT_THRESHOLD:
+        if SKIP_SITE_AGENTS and is_site_agent(item):
+            log(f"  пропускаю {item['id']}: на сайті автор позначений як «{site_user_type(item)}»")
+            delivered = True
+        elif SKIP_SUSPECTED_AGENTS and suspect >= AGENT_THRESHOLD:
             log(f"  пропускаю {item['id']}: у автора {suspect} оголошень")
             delivered = True
-        elif telegram_ready():
-            delivered = send_listing(item, label, count)
         else:
-            print_listing(item, label, count)
-            delivered = True
+            if OPENAI_API_KEY and TRANSLATE_ALERTS and time.time() < translate_deadline:
+                translate_listing(item)
+            if telegram_ready():
+                delivered = send_listing(item, label, count)
+            else:
+                print_listing(item, label, count)
+                delivered = True
         if delivered:  # не дійшло — спробуємо наступного запуску
             mark_seen(state, item["id"], day)
             register_author(state, item, day)

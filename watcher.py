@@ -139,7 +139,8 @@ def as_dict(value):
 
 # ─────────────────────────────── myhome.ge ───────────────────────────────
 
-def http_get_json(url, headers):
+def http_get(url, headers):
+    """GET → текст відповіді або FetchError."""
     try:
         if cffi_requests:
             resp = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=30)
@@ -156,8 +157,12 @@ def http_get_json(url, headers):
     if status != 200:
         hint = " — схоже на захист від ботів" if status in (403, 429, 503) else ""
         raise FetchError(f"HTTP {status}{hint}")
+    return body
+
+
+def http_get_json(url, headers):
     try:
-        return json.loads(body)
+        return json.loads(http_get(url, headers))
     except ValueError:
         raise FetchError("відповідь не JSON — можливо, сторінка перевірки від Cloudflare")
 
@@ -208,8 +213,30 @@ def search_params(search_url):
 
 
 def list_url(params, page):
-    query = urllib.parse.urlencode(params + [("page", str(page)), ("locale", LANG)], safe=",")
-    return f"{API_URL}?{query}"
+    """Сторінка пошуку на сайті, а не API.
+
+    З 07.10.2026 API пошуку (/v1/statements) без входу в акаунт відповідає 401. Але сторінку
+    пошуку сайт збирає на сервері для будь-якого відвідувача й кладе в неї той самий список
+    оголошень, що раніше віддавало API, — його й беремо (page_statements).
+    """
+    query = urllib.parse.urlencode(params + [("page", str(page))], safe=",")
+    return f"{SITE}{'' if LANG == 'ka' else '/' + LANG}/s/?{query}"
+
+
+def page_statements(html_text):
+    """Відповідь API зі списком оголошень, вбудована в сторінку пошуку (__NEXT_DATA__)."""
+    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_text, re.S)
+    if not match:
+        raise FetchError("на сторінці немає даних — можливо, сторінка перевірки від Cloudflare")
+    try:
+        props = as_dict(as_dict(json.loads(match.group(1))).get("props"))
+    except ValueError:
+        raise FetchError("дані сторінки не читаються — можливо, сайт змінився")
+    for query in as_dict(as_dict(props.get("pageProps")).get("dehydratedState")).get("queries") or []:
+        key = as_dict(query).get("queryKey")
+        if isinstance(key, list) and key[:2] == ["statements", "list"]:
+            return as_dict(as_dict(query.get("state")).get("data"))
+    raise FetchError("на сторінці пошуку немає списку оголошень — можливо, сайт змінився")
 
 
 def detail_url(listing_id):
@@ -217,9 +244,9 @@ def detail_url(listing_id):
 
 
 def fetch_page(params, page):
-    data = http_get_json(list_url(params, page), api_headers())
-    if not isinstance(data, dict) or data.get("result") is False:
-        raise FetchError(f"API повернуло помилку: {str(data)[:200]}")
+    data = page_statements(http_get(list_url(params, page), {"Accept-Language": LANG}))
+    if data.get("result") is False:
+        raise FetchError(f"сайт повернув помилку: {str(data)[:200]}")
     items = as_dict(data.get("data")).get("data")
     if not isinstance(items, list):
         raise FetchError("неочікуваний формат відповіді — можливо, сайт змінив API")
@@ -962,7 +989,7 @@ def cmd_test():
 def cmd_dump():
     """Зберігає «сирі» відповіді сайту, щоб подивитися, які поля там є."""
     label, url = load_searches()[0]
-    raw_list = http_get_json(list_url(search_params(url), 1), api_headers())
+    raw_list = page_statements(http_get(list_url(search_params(url), 1), {"Accept-Language": LANG}))
     (BASE_DIR / "dump_list.json").write_text(
         json.dumps(raw_list, ensure_ascii=False, indent=2), encoding="utf-8")
     items = as_dict(as_dict(raw_list).get("data")).get("data") or []

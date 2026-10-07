@@ -45,6 +45,7 @@ FETCH_DETAILS = True           # догружати картку нового о
 AGENT_THRESHOLD = 3            # від скількох оголошень в одного автора ставити позначку ⚠️
 SKIP_SUSPECTED_AGENTS = False  # True — такі оголошення взагалі не надсилати
 SKIP_SITE_AGENTS = True        # сайт сам позначив автора «Агент» — не надсилати (False — надсилати з ⚠️)
+SKIP_SELF_DECLARED_AGENTS = True  # автор сам пише в описі «я агент» — не надсилати (False — надсилати з ⚠️)
 MAX_ALERTS_PER_RUN = 25        # запобіжник від спаму; решта прийде наступного запуску
 LOOP_MINUTES = 10              # інтервал у безперервному режимі
 FAIL_ALERT_AFTER = 6           # після скількох невдалих перевірок поспіль написати в Telegram
@@ -365,12 +366,26 @@ AGENT_WORD = re.compile(
     r"agenc\w*|agent\w*|realtor\w*|broker\w*|commission\w*|"
     r"სააგენტო\w*|აგენტ\w*|რიელტორ\w*|მაკლერ\w*|ბროკერ\w*|საკომისიო\w*|შუამავ\w*",
     re.IGNORECASE)
-NEGATION_BEFORE = re.compile(r"\b(без|не|no|non|without)\W*$", re.IGNORECASE)
+COOPERATE = r"(?:сотрудн\w*|работ\w*|звон\w*|пиш\w*|обращ\w*|беспок\w*|прац\w*|співпрац\w*|work\w*|deal\w*|cooperat\w*)"
+NEGATION_BEFORE = re.compile(
+    r"(?:\b(?:без|не|no|non|without)\W*"                                              # «без комиссии», «не агентство»
+    r"|\b(?:не|not|don'?t|do\W+not)\W+" + COOPERATE + r"(?:\W+(?:с|со|з|із|with))?\W*"  # «не сотрудничаю с риелторами»
+    r"|(?:არ|ნუ)\W+(?:ვთანამშრომლ|ვმუშა|ვითანამშრომლ|ვიმუშავ)[^\W\d_]*\W*)$",         # «არ ვთანამშრომლობ სააგენტოებთან»
+    re.IGNORECASE)
 NEGATION_AFTER = re.compile(
     r"^\W*(?:\w+\W+){0,4}?(?:просьба\W+|прошу\W+|пожалуйста\W+|please\W+|გთხოვთ\W+)?"
-    r"(?:не\W+(?:звон|беспок|пис|обращ|турб|дзвон|пиш)"
-    r"|(?:do\W+not|don'?t|not)\W+(?:call|contact|disturb|bother|text|write)"
+    r"(?:не\W+(?:звон|беспок|пис|обращ|турб|дзвон|пиш|работ|сотрудн|нуж|интерес|рассматр|прац|співпрац)"
+    r"|(?:do\W+not|don'?t|not)\W+(?:call|contact|disturb|bother|text|write|work|need)"
     r"|(?:არ|ნუ)\W|გარეშე)",
+    re.IGNORECASE)
+JOINED = re.compile(r"^\W*(?:и|і|й|та|или|або|and|or)?\W*$", re.IGNORECASE)  # «с агентствами и риелторами»
+# Автор прямо називає себе агентом — це вже не підозра, а факт (SKIP_SELF_DECLARED_AGENTS)
+SELF_AGENT_WORD = r"(?:агент(?:ом)?|агентство|риелтор(?:ом)?|риэлтор(?:ом)?|рієлтор(?:ом)?|маклер(?:ом)?|брокер(?:ом)?)\b"
+SELF_AGENT = re.compile(  # «я агент», «являюсь агентом»; але не «я агентствам не сдаю», «я не агент»
+    r"\bя\W+(?:являюсь\W+|-\W*)?" + SELF_AGENT_WORD +
+    r"|\bявляюсь\W+" + SELF_AGENT_WORD +
+    r"|\bi(?:\W+am|'m)\W+(?:an?\W+)?(?:real\W+estate\W+)?(?:agent|realtor|broker)\b"
+    r"|(?<!არ )\bვარ\W+(?:აგენტი|რიელტორი|მაკლერი|ბროკერი)\b|(?:აგენტი|რიელტორი|მაკლერი|ბროკერი)\W+ვარ\b",
     re.IGNORECASE)
 
 
@@ -378,14 +393,23 @@ def text_signals(text):
     """(є ознаки агенції в тексті, автор пише «без посередників»)."""
     text = str(text or "")
     agent = owner = False
+    prev_end, prev_negated = None, False
     for m in AGENT_WORD.finditer(text):
-        before = text[max(0, m.start() - 9):m.start()]
+        before = text[max(0, m.start() - 40):m.start()]
         after = text[m.end():m.end() + 60]
-        if NEGATION_BEFORE.search(before) or NEGATION_AFTER.search(after):
-            owner = True   # «агентствам не звонить», «без комиссии», «no agents»...
+        negated = bool(NEGATION_BEFORE.search(before) or NEGATION_AFTER.search(after)
+                       or (prev_negated and JOINED.match(text[prev_end:m.start()])))
+        if negated:
+            owner = True   # «агентствам не звонить», «без комиссии», «не сотрудничаю с риелторами»...
         else:
-            agent = True   # «комиссия агентства 50%», «real estate agency»...
+            agent = True   # «комиссия агентства 50%», «real estate agency», «я являюсь агентом»...
+        prev_end, prev_negated = m.end(), negated
     return agent, owner
+
+
+def self_declared_agent(item):
+    """Автор сам пише в описі, що він агент («я агент», «являюсь агентом», «I am an agent»)."""
+    return bool(SELF_AGENT.search(plain_text(item.get("comment")) + " " + str(item.get("_ru_comment") or "")))
 
 
 def phone_fingerprint(digits):
@@ -922,6 +946,9 @@ def run_once(state):
         suspect = max(count, item.get("_site_count") or 0)
         if SKIP_SITE_AGENTS and is_site_agent(item):
             log(f"  пропускаю {item['id']}: на сайті автор позначений як «{site_user_type(item)}»")
+            delivered = True
+        elif SKIP_SELF_DECLARED_AGENTS and self_declared_agent(item):
+            log(f"  пропускаю {item['id']}: автор сам пише в описі, що він агент")
             delivered = True
         elif SKIP_SUSPECTED_AGENTS and suspect >= AGENT_THRESHOLD:
             log(f"  пропускаю {item['id']}: у автора {suspect} оголошень")

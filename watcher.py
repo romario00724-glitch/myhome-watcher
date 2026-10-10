@@ -224,8 +224,8 @@ def list_url(params, page):
     return f"{SITE}{'' if LANG == 'ka' else '/' + LANG}/s/?{query}"
 
 
-def page_statements(html_text):
-    """Відповідь API зі списком оголошень, вбудована в сторінку пошуку (__NEXT_DATA__)."""
+def page_query(html_text, kind):
+    """Відповідь API, яку сайт вбудовує в сторінку (__NEXT_DATA__ → запит ["statements", kind, …])."""
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html_text, re.S)
     if not match:
         raise FetchError("на сторінці немає даних — можливо, сторінка перевірки від Cloudflare")
@@ -235,13 +235,28 @@ def page_statements(html_text):
         raise FetchError("дані сторінки не читаються — можливо, сайт змінився")
     for query in as_dict(as_dict(props.get("pageProps")).get("dehydratedState")).get("queries") or []:
         key = as_dict(query).get("queryKey")
-        if isinstance(key, list) and key[:2] == ["statements", "list"]:
+        if isinstance(key, list) and key[:2] == ["statements", kind]:
             return as_dict(as_dict(query.get("state")).get("data"))
-    raise FetchError("на сторінці пошуку немає списку оголошень — можливо, сайт змінився")
+    raise FetchError(f"на сторінці немає даних «{kind}» — можливо, сайт змінився")
+
+
+def page_statements(html_text):
+    """Список оголошень зі сторінки пошуку."""
+    return page_query(html_text, "list")
 
 
 def detail_url(listing_id):
-    return f"{API_URL}/{listing_id}?locale={LANG}"
+    """Сторінка оголошення, а не API.
+
+    З 09.10.2026 ~13:40 і картка в API (/v1/statements/{id}) без входу в акаунт відповідає 401.
+    Але сторінку оголошення сайт збирає на сервері з тією самою карткою — її й беремо.
+    """
+    return f"{SITE}{'' if LANG == 'ka' else '/' + LANG}/pr/{listing_id}/"
+
+
+def fetch_detail(listing_id):
+    """Картка оголошення у форматі колишнього API: {"result": …, "data": {"statement": {…}}}."""
+    return page_query(http_get(detail_url(listing_id), {"Accept-Language": LANG}), "details")
 
 
 def fetch_page(params, page):
@@ -327,7 +342,7 @@ def enrich_with_details(item):
     """Догружає картку оголошення: телефон, id автора, повніший опис і кількість оголошень автора."""
     apply_author_listing_count(item, item)  # раптом лічильник є вже у видачі
     try:
-        data = http_get_json(detail_url(item["id"]), api_headers())
+        data = fetch_detail(item["id"])
     except FetchError as e:
         log(f"  картка {item['id']}: {e}")
         return item
@@ -1022,7 +1037,7 @@ def cmd_dump():
     items = as_dict(as_dict(raw_list).get("data")).get("data") or []
     log(f"[{label}] збережено dump_list.json ({len(items)} оголошень)")
     if items and isinstance(items[0], dict) and items[0].get("id"):
-        raw_detail = http_get_json(detail_url(items[0]["id"]), api_headers())
+        raw_detail = fetch_detail(items[0]["id"])
         (BASE_DIR / "dump_detail.json").write_text(
             json.dumps(raw_detail, ensure_ascii=False, indent=2), encoding="utf-8")
         log("збережено dump_detail.json (картка першого оголошення)")

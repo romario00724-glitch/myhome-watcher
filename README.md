@@ -58,7 +58,7 @@ python watcher.py           # стежить, поки комп'ютер уві�
 2. «uploading an existing file» → перетягніть `watcher.py`, `searches.txt`, `requirements.txt`, `README.md` → **Commit**.
 3. **Add file → Create new file**, назва: `.github/workflows/watch.yml`, вставте вміст однойменного файлу → **Commit**.
 4. **Settings → Secrets and variables → Actions → New repository secret**: додайте `TELEGRAM_BOT_TOKEN` і `TELEGRAM_CHAT_ID`.
-5. **Actions → myhome-watcher → Run workflow**. Перший запуск надішле «✅ Стежу за пошуком…», далі нові оголошення приходитимуть самі.
+5. **Actions → myhome_batumi → Run workflow**. Перший запуск надішле «✅ Стежу за пошуком…», далі нові оголошення приходитимуть самі.
 
 Нотатки:
 - У публічному репозиторії запуски безкоштовні без обмежень. Видно в ньому лише код, посилання на пошук і `state.json` (номери вже побачених оголошень); токен захований у Secrets.
@@ -101,11 +101,11 @@ cron-job.org ──► GitHub Actions ──► myhome.ge ──► Telegram
 
 ### Як налаштований будильник
 
-Завдання `myhome-watcher` на [console.cron-job.org](https://console.cron-job.org/jobs):
+Завдання `myhome_batumi` на [console.cron-job.org](https://console.cron-job.org/jobs):
 
 | Поле | Значення |
 |---|---|
-| URL | `https://api.github.com/repos/romario00724-glitch/myhome-watcher/actions/workflows/watch.yml/dispatches` |
+| URL | `https://api.github.com/repos/romario00724-glitch/myhome_batumi/actions/workflows/watch.yml/dispatches` |
 | Розклад | Every 10 minutes (`*/10 * * * *`) |
 | Request method | `POST` |
 | Request body | `{"ref":"main"}` |
@@ -129,12 +129,12 @@ cron-job.org ──► GitHub Actions ──► myhome.ge ──► Telegram
 
 Лікується за дві хвилини:
 [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new)
-→ новий токен, `Only select repositories` → `myhome-watcher`, право `Actions: Read and write`
+→ новий токен, `Only select repositories` → `myhome_batumi`, право `Actions: Read and write`
 → підставити його в заголовок `Authorization` того самого завдання на cron-job.org → **SAVE**.
 
 ### Як перевірити, що бот живий
 
-Відкрити [Actions репозиторію](https://github.com/romario00724-glitch/myhome-watcher/actions):
+Відкрити [Actions репозиторію](https://github.com/romario00724-glitch/myhome_batumi/actions):
 якщо верхній запуск свіжий (не старший за ~15 хвилин) і зелений — усе гаразд.
 `нових оголошень немає` у логу — нормальна відповідь, а не поломка: бот сходив на сайт,
 звірив із базою й не знайшов нічого нового.

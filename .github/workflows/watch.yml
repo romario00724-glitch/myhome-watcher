@@ -1,4 +1,4 @@
-name: myhome-watcher
+name: myhome_batumi
 
 on:
   schedule:
@@ -9,7 +9,7 @@ permissions:
   contents: write             # щоб зберігати state.json у репозиторій
 
 concurrency:
-  group: myhome-watcher
+  group: myhome_batumi
   cancel-in-progress: false
 
 jobs:

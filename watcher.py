@@ -36,6 +36,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # кілька чатів — через кому
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # якщо задано — грузинські/англійські описи в чаті перекладаються
 OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-5-mini"
+# Без «роздумів»: перекладу вони не потрібні, а були 93% оплачуваних токенів (перевірка 13.10.2026).
+# Порожньо — модель вирішує сама; для моделей без роздумів (gpt-4o тощо) теж порожньо.
+OPENAI_REASONING = os.getenv("OPENAI_REASONING", "minimal")
 
 LANG = "ru"                    # мова назв і посилань з myhome.ge: ru / en / ka
 ONLY_OWNERS = True             # завжди додавати фільтр «Власник» (owner_type=physical)
@@ -780,6 +783,7 @@ def send_listing(item, label, count):
 def openai_json(system, data):
     """Запит до OpenAI з відповіддю-JSON. Повертає dict або кидає FetchError."""
     payload = {"model": OPENAI_MODEL, "response_format": {"type": "json_object"},
+               **({"reasoning_effort": OPENAI_REASONING} if OPENAI_REASONING else {}),
                "max_completion_tokens": 4000,
                "messages": [{"role": "system", "content": system},
                             {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]}

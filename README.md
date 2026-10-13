@@ -74,7 +74,9 @@ python watcher.py           # стежить, поки комп'ютер уві�
 
 - Локально ключ — `"openai_key": "sk-..."` у `telegram.json`.
 - Модель за замовчуванням — `gpt-5-mini` (частки цента за оголошення). Іншу можна вказати в
-  **Settings → Secrets and variables → Actions → Variables** змінною `OPENAI_MODEL`.
+  **Settings → Secrets and variables → Actions → Variables** змінною `OPENAI_MODEL`. Модель перекладає
+  без «роздумів» (`OPENAI_REASONING = minimal`): так у 13 разів менше токенів і в 10 разів швидше при тій
+  самій якості описів. Дешевша `gpt-5-nano` вигадувала назви вулиць, тому її не беремо.
 - Вимкнути — `TRANSLATE_ALERTS = False` угорі `watcher.py`.
 
 ## Хто насправді запускає бота

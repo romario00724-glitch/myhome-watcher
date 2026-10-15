@@ -4625,7 +4625,7 @@
 "2026-10-15"
 ]
 },
-"fail_streak": 0,
+"fail_streak": 1,
 "regular_seeded": [
 "cities=15&currency_id=1&deal_types=2&owner_type=physical&real_estate_types=1"
 ],

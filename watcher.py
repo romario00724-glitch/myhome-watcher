@@ -39,8 +39,9 @@ AI_MODEL = "claude-haiku-5-5"  # до 14.10.2026 — OpenAI gpt-5-mini
 
 LANG = "ru"                    # мова назв і посилань з myhome.ge: ru / en / ka
 ONLY_OWNERS = True             # завжди додавати фільтр «Власник» (owner_type=physical)
-PAGES_PER_RUN = 3              # скільки сторінок видачі перевіряти за один запуск
-SEED_PAGES = 10                # скільки сторінок «запам'ятати» при першому запуску пошуку
+REGULAR_PER_RUN = 48           # скільки щонайменше звичайних (не VIP) оголошень переглядати за запуск
+SEED_REGULAR = 120             # скільки звичайних оголошень «запам'ятати» при першому запуску пошуку
+MAX_PAGES_PER_RUN = 40         # запобіжник: більше сторінок одного пошуку за запуск не гортати
 FETCH_DETAILS = True           # догружати картку нового оголошення (телефон, автор)
 AGENT_THRESHOLD = 3            # від скількох оголошень в одного автора ставити позначку ⚠️
 SKIP_SUSPECTED_AGENTS = False  # True — такі оголошення взагалі не надсилати
@@ -272,6 +273,16 @@ def fetch_page(params, page):
     if not isinstance(items, list):
         raise FetchError("неочікуваний формат відповіді — можливо, сайт змінив API")
     return [it for it in items if isinstance(it, dict) and str(it.get("id", "")).isdigit()]
+
+
+def is_paid(item):
+    """Платне оголошення (Super VIP, VIP+, VIP).
+
+    У видачі myhome.ge платні завжди стоять першими — блоками Super VIP → VIP+ → VIP, кожен від
+    свіжіших до старших, — і лише за ними звичайні; ні сортування, ні фільтра «без VIP» на сайті
+    немає (перевірено в Тбілісі 15.10.2026). В оренді Батумі платних ~59 (2,5 сторінки).
+    """
+    return any(item.get(k) for k in ("is_super_vip", "is_vip_plus", "is_vip"))
 
 
 DETAIL_FIELDS = ("user_id", "user_phone_number", "additional_phone_number", "user_title",
@@ -853,7 +864,8 @@ def translate_listing(item):
 # ─────────────────────────────── база (state.json) ───────────────────────────────
 
 def new_state():
-    return {"version": 1, "searches": {}, "seen": {}, "authors": {}, "fail_streak": 0}
+    # regular_seeded — пошуки, які вже гортають повз платні оголошення (див. run_once)
+    return {"version": 1, "searches": {}, "seen": {}, "authors": {}, "fail_streak": 0, "regular_seeded": []}
 
 
 def load_state():
@@ -916,32 +928,57 @@ def run_once(state):
             continue
         key = urllib.parse.urlencode(sorted(params), safe=",")
         seeding = key not in state["searches"]
-        pages = SEED_PAGES if seeding else PAGES_PER_RUN
+        # Пошук, засіяний до 15.10.2026, коли бот ще не гортав повз платні: звичайні оголошення, яких
+        # він тоді не бачив, один раз тихо запам'ятовуємо — інакше прийшли б у групу пачкою.
+        catching_up = not seeding and key not in state["regular_seeded"]
+        quiet = seeding or catching_up
+        need = SEED_REGULAR if quiet else REGULAR_PER_RUN
 
-        found, ok = [], False
-        for page in range(1, pages + 1):
+        # Гортаємо, доки не пройдемо всі платні (is_paid) і не переглянемо щонайменше need звичайних;
+        # у звичайному запуску — ще й доти, доки на сторінці трапляються незнайомі звичайні (бот пропустив
+        # кілька запусків). MAX_PAGES_PER_RUN — запобіжник.
+        found, ok, failed, regular = [], False, False, 0
+        for page in range(1, MAX_PAGES_PER_RUN + 1):
             try:
                 items = fetch_page(params, page)
             except FetchError as e:
                 log(f"[{label}] сторінка {page}: {e}")
+                failed = True
                 break
             ok = True
             if not items:
                 break
             found.extend(items)
-            if page < pages:
-                time.sleep(random.uniform(1.0, 2.0))
+            fresh = [it for it in items if not is_paid(it)]
+            regular += len(fresh)
+            if regular >= need and (quiet or all(int(it["id"]) in seen for it in fresh)):
+                break
+            time.sleep(random.uniform(1.0, 2.0))
+        else:
+            log(f"[{label}] {MAX_PAGES_PER_RUN} сторінок, а звичайних оголошень лише {regular} — "
+                "платних стало забагато?")
         if not ok:
             continue
         any_ok = True
 
-        if seeding:  # перший запуск цього пошуку: запам'ятовуємо все, нічого не шлемо
+        if quiet:  # перший запуск цього пошуку чи перший після 15.10.2026: запам'ятовуємо все, нічого не шлемо
+            added = 0
             for item in found:
                 listing_id = int(item["id"])
                 if listing_id not in seen and listing_id not in batch:
                     seen.add(listing_id)
                     mark_seen(state, listing_id, day)
                     register_author(state, item, day)
+                    added += not is_paid(item)
+            if failed:  # не дочитали — наступного запуску ще раз тихо, інакше решта прийде пачкою
+                log(f"[{label}] не дочитав видачу: тихо запам'ятав {added} звичайних, "
+                    "решту — наступного запуску")
+                continue
+            state["regular_seeded"].append(key)
+            if catching_up:
+                log(f"[{label}] гортаю повз платні оголошення: тихо запам'ятав {added} звичайних, "
+                    "яких раніше не бачив")
+                continue
             state["searches"][key] = day
             log(f"[{label}] перший запуск: запам'ятав {len(found)} оголошень, далі — лише нові")
             if telegram_ready():

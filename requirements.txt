@@ -1,1 +1,2 @@
 curl_cffi>=0.10
+anthropic>=1.13

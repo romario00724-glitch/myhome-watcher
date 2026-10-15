@@ -34,11 +34,8 @@ from pathlib import Path
 # а на своєму комп'ютері — з файлу telegram.json поруч зі скриптом.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # кілька чатів — через кому
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # якщо задано — грузинські/англійські описи в чаті перекладаються
-OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-5-mini"
-# Без «роздумів»: перекладу вони не потрібні, а були 93% оплачуваних токенів (перевірка 13.10.2026).
-# Порожньо — модель вирішує сама; для моделей без роздумів (gpt-4o тощо) теж порожньо.
-OPENAI_REASONING = os.getenv("OPENAI_REASONING", "minimal")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # якщо задано — грузинські/англійські описи в чаті перекладаються
+AI_MODEL = "claude-haiku-5-5"  # до 14.10.2026 — OpenAI gpt-5-mini
 
 LANG = "ru"                    # мова назв і посилань з myhome.ge: ru / en / ka
 ONLY_OWNERS = True             # завжди додавати фільтр «Власник» (owner_type=physical)
@@ -53,14 +50,14 @@ MAX_ALERTS_PER_RUN = 25        # запобіжник від спаму; реш�
 LOOP_MINUTES = 10              # інтервал у безперервному режимі
 FAIL_ALERT_AFTER = 6           # після скількох невдалих перевірок поспіль написати в Telegram
 KEEP_DAYS = 60                 # скільки днів пам'ятати побачені оголошення
-TRANSLATE_ALERTS = True        # з OPENAI_API_KEY: перекладати російською грузинські/англійські опис і адресу в чаті
+TRANSLATE_ALERTS = True        # з ANTHROPIC_API_KEY: перекладати російською грузинські/англійські опис і адресу в чаті
 TRANSLATE_BUDGET_SECONDS = 180 # не більше стільки секунд на переклади за одну перевірку (запобіжник для GitHub)
 # ──────────────────────────────────────────────────────────────────────────────
 
 BASE_DIR = Path(__file__).resolve().parent
 SEARCHES_FILE = BASE_DIR / "searches.txt"
 STATE_FILE = BASE_DIR / "state.json"
-TELEGRAM_FILE = BASE_DIR / "telegram.json"  # {"token": "...", "chat_id": "...", "openai_key": "..."} — не викладати на GitHub!
+TELEGRAM_FILE = BASE_DIR / "telegram.json"  # {"token": "...", "chat_id": "...", "anthropic_key": "..."} — не викладати на GitHub!
 
 API_URL = "https://api-statements.tnet.ge/v1/statements"
 SITE = "https://www.myhome.ge"
@@ -78,6 +75,11 @@ try:  # curl_cffi відправляє запит «як справжній Chro
 except ImportError:
     cffi_requests = None
 
+try:  # без бібліотеки anthropic не працює лише переклад: pip install anthropic
+    import anthropic
+except ImportError:
+    anthropic = None
+
 def ssl_context():
     """Набір сертифікатів certifi: на Mac вбудований Python часто їх не бачить."""
     import ssl
@@ -93,8 +95,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def load_telegram_file():
-    """Доповнює токен, chat_id і ключ OpenAI з telegram.json, якщо їх не задано змінними середовища."""
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OPENAI_API_KEY
+    """Доповнює токен, chat_id і ключ Anthropic з telegram.json, якщо їх не задано змінними середовища."""
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY
     if not TELEGRAM_FILE.exists():
         return
     try:
@@ -104,7 +106,7 @@ def load_telegram_file():
         return
     TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or str(cfg.get("token") or "").strip()
     TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID or str(cfg.get("chat_id") or "").strip()
-    OPENAI_API_KEY = OPENAI_API_KEY or str(cfg.get("openai_key") or "").strip()
+    ANTHROPIC_API_KEY = ANTHROPIC_API_KEY or str(cfg.get("anthropic_key") or "").strip()
 
 
 load_telegram_file()
@@ -778,29 +780,35 @@ def send_listing(item, label, count):
     return delivered
 
 
-# ─────────────────────────────── переклад (OpenAI) ───────────────────────────────
+# ─────────────────────────────── переклад (Claude) ───────────────────────────────
 
-def openai_json(system, data):
-    """Запит до OpenAI з відповіддю-JSON. Повертає dict або кидає FetchError."""
-    payload = {"model": OPENAI_MODEL, "response_format": {"type": "json_object"},
-               **({"reasoning_effort": OPENAI_REASONING} if OPENAI_REASONING else {}),
-               "max_completion_tokens": 4000,
-               "messages": [{"role": "system", "content": system},
-                            {"role": "user", "content": json.dumps(data, ensure_ascii=False)}]}
+def claude_json(system, data, schema):
+    """Запит до Claude з відповіддю-JSON за схемою. Повертає dict або кидає FetchError."""
+    if anthropic is None:
+        raise FetchError("немає бібліотеки anthropic (pip install anthropic)")
     try:
-        status, body = _post_json("https://api.openai.com/v1/chat/completions", payload,
-                                  {"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=120)
-    except Exception as e:
-        raise FetchError(f"мережева помилка: {e}") from e
+        # бібліотека сама повторює запит при 429, 5xx і обриві зв'язку
+        response = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60, max_retries=2).messages.create(
+            model=AI_MODEL,
+            max_tokens=4000,
+            system=system,
+            messages=[{"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
+            # "low" — найнижчий рівень мислення (рівня "minimal" у Claude немає); temperature не задається
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": schema}},
+        )
+    except anthropic.APIStatusError as e:
+        raise FetchError(f"HTTP {e.status_code}: {str(e.message)[:200]}")
+    except anthropic.APIConnectionError as e:
+        raise FetchError(f"мережева помилка: {str(e)[:150]}")
+    if response.stop_reason == "refusal":
+        raise FetchError("модель відмовилась")
+    if response.stop_reason == "max_tokens":
+        raise FetchError("модель не встигла відповісти (ліміт токенів)")
+    # першим може прийти блок мислення — відповідь шукати за типом блоку
+    text = next((b.text for b in response.content if b.type == "text"), "")
     try:
-        data = json.loads(body)
+        parts = json.loads(text)
     except ValueError:
-        raise FetchError(f"HTTP {status}")
-    if status != 200:
-        raise FetchError(clean(as_dict(data.get("error")).get("message")) or f"HTTP {status}")
-    try:
-        parts = json.loads(data["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError, ValueError):
         raise FetchError("відповідь не в очікуваному форматі")
     if not isinstance(parts, dict):
         raise FetchError("відповідь не в очікуваному форматі")
@@ -812,6 +820,8 @@ TRANSLATE_PROMPT = """Переведи на русский язык описан
 Переводи точно, ничего не добавляй и не сокращай, эмодзи оставь. Названия улиц передавай
 по-русски: «რუსთაველის ქ. 15» → «ул. Руставели 15», «ჭავჭავაძის ქ.» → «ул. Чавчавадзе».
 Если поле пустое или уже на русском — верни его как есть."""
+TRANSLATE_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["description", "address"],
+                    "properties": {"description": {"type": "string"}, "address": {"type": "string"}}}
 
 
 def needs_translation(text):
@@ -829,7 +839,7 @@ def translate_listing(item):
     if not (needs_translation(desc) or needs_translation(address)):
         return False
     try:
-        parts = openai_json(TRANSLATE_PROMPT, {"description": desc, "address": address})
+        parts = claude_json(TRANSLATE_PROMPT, {"description": desc, "address": address}, TRANSLATE_SCHEMA)
     except FetchError as e:
         log(f"  переклад {item['id']}: {e}")
         return True
@@ -973,7 +983,7 @@ def run_once(state):
             log(f"  пропускаю {item['id']}: у автора {suspect} оголошень")
             delivered = True
         else:
-            if OPENAI_API_KEY and TRANSLATE_ALERTS and time.time() < translate_deadline:
+            if ANTHROPIC_API_KEY and TRANSLATE_ALERTS and time.time() < translate_deadline:
                 translate_listing(item)
             if telegram_ready():
                 delivered = send_listing(item, label, count)
@@ -1091,8 +1101,8 @@ def cmd_chat_id():
     global TELEGRAM_CHAT_ID
     TELEGRAM_CHAT_ID = str(choice)
     config = {"token": TELEGRAM_BOT_TOKEN, "chat_id": TELEGRAM_CHAT_ID}
-    if OPENAI_API_KEY:
-        config["openai_key"] = OPENAI_API_KEY
+    if ANTHROPIC_API_KEY:
+        config["anthropic_key"] = ANTHROPIC_API_KEY
     TELEGRAM_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     send_text("✅ Бот підключено! Сюди приходитимуть нові оголошення від власників з myhome.ge.")
     log(f"chat_id {choice} ({chats[choice]}) збережено в telegram.json, у чат надіслано привітання")

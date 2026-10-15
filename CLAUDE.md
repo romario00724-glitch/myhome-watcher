@@ -56,11 +56,17 @@ GitHub → Settings → Secrets and variables → Actions:
 |---|---|
 | `TELEGRAM_BOT_TOKEN` (secret) | токен бота; **перевипущений 29.09.2026**. Він же ключ HMAC для відбитків телефонів у `state.json` (`phone_fingerprint`): нова заміна токена = лічильник «телефон уже траплявся» почне рахувати заново |
 | `TELEGRAM_CHAT_ID` (secret) | робоча група, куди йдуть оголошення |
-| `OPENAI_API_KEY` (secret) | переклад російською грузинських/англійських описів і адрес у групі. Без нього — просто без перекладу |
-| `OPENAI_MODEL` (variable) | необов'язкова; за замовчуванням `gpt-5-mini` |
-| `OPENAI_REASONING` (variable) | необов'язкова; за замовчуванням `minimal` — без «роздумів» (див. нижче) |
+| `ANTHROPIC_API_KEY` (secret) | переклад російською грузинських/англійських описів і адрес у групі (Claude Haiku 5.5, з 14.10.2026). Без нього — просто без перекладу |
+| `OPENAI_API_KEY` (secret) | до 14.10.2026; більше не читається, можна видалити |
 
-**Модель для перекладу — рішення 13.10.2026.** Перевірка на 20 грузинських оголошеннях (тимчасовий
+**Модель для перекладу — з 14.10.2026 `claude-haiku-5-5`** (`AI_MODEL` у коді, змінною GitHub не
+задається), бібліотека `anthropic` (`requirements.txt`), функція `claude_json`: `messages.create` з
+`output_config: {"effort": "low", "format": {"type": "json_schema", "schema": TRANSLATE_SCHEMA}}`, `max_tokens`
+4000, `temperature` не задається; відповідь — перший блок типу `text` (першим може прийти `thinking`);
+`refusal` / `max_tokens` / HTTP-помилка → `FetchError`, оголошення йде без перекладу. Повтори при 429/5xx
+робить бібліотека (`max_retries=2`, тайм-аут 60 с). Підказка `TRANSLATE_PROMPT` не змінювалась.
+
+*Як було до 14.10 — рішення 13.10.2026 (OpenAI).* Перевірка на 20 грузинських оголошеннях (тимчасовий
 workflow, потім видалений): `gpt-5-mini` як було — 223 токени на вході й 1486 на виході, з них 1386 —
 «роздуми» (93%), 11 с; `gpt-5-mini` з `reasoning_effort: minimal` — 223 + 98, 1 с, описи того самого
 рівня, 2 з 20 адрес лишилися грузинською; `gpt-5-nano` minimal — 223 + 102, але **вигадує вулиці**
@@ -68,7 +74,7 @@ workflow, потім видалений): `gpt-5-mini` як було — 223 т�
 mini без роздумів. Бот і так коштував копійки (~40 перекладів/добу); основні витрати OpenAI —
 у ботах Facebook/Telegram/Threads, що класифікують кожен пост.
 
-Локально — `telegram.json` у корені (`token`, `chat_id`, `openai_key`), у `.gitignore`.
+Локально — `telegram.json` у корені (`token`, `chat_id`, `anthropic_key`), у `.gitignore`.
 Репозиторій **публічний**: жодних ключів у коді й комітах.
 
 ## Агенти: що відсіюємо, а що лише позначаємо
@@ -113,7 +119,7 @@ GitHub ще ~9 хв, чекаючи натискань), шаблон `channel_t
 - **Не запускати `python watcher.py` на комп'ютері паралельно з GitHub** — у двох копій різні
   `state.json`, і ті самі оголошення прийдуть у групу двічі.
 - **`import watcher` + наявний `telegram.json` = реальні повідомлення** в робочу групу. У тестах
-  глушити `tg_call`, `tg_upload`, `download_image`, `_post_json` (OpenAI) і `save_state` (або
+  глушити `tg_call`, `tg_upload`, `download_image`, `anthropic.Anthropic` (переклад; або одразу `claude_json`) і `save_state` (або
   підмінити `STATE_FILE`). Замість походів на myhome.ge `http_get_json` можна підмінити
   локальними `dump_list.json` / `dump_detail.json` (у `.gitignore`, є лише на Mac).
   Токен у локальному `telegram.json` може бути старим, відкликаним — тоді він просто не працює.
@@ -137,3 +143,22 @@ GitHub ще ~9 хв, чекаючи натискань), шаблон `channel_t
   команду, але за правилами цього файлу. Якщо правка в цього бота не лягає чи суперечить рішенням тут —
   нічого не міняти, а відповісти координатору чому. Після роботи — короткий звіт координатору: що змінено,
   які перевірки, чи перезапущено бота.
+
+## Історія
+
+### 14.10.2026 — переклад: OpenAI → Claude Haiku 5.5 (масова правка координатора №2)
+- 14.10 ~19:33 на OpenAI закінчились гроші, поповнювати користувач не буде; описи йшли без перекладу.
+- Змінено лише постачальника AI (пошук, фільтри, картки, підказка — як були). Для перенесення в близнюків
+  (ss.ge_batumi «один в один», myhome_tbilisi через `sync_from_batumi.py`) — увесь перелік:
+  - `watcher.py`: `OPENAI_API_KEY` → `ANTHROPIC_API_KEY`; `OPENAI_MODEL` + `OPENAI_REASONING` →
+    `AI_MODEL = "claude-haiku-5-5"`; `import anthropic` у `try` (без бібліотеки — лише без перекладу);
+    `openai_json` → `claude_json(system, data, schema)` (див. «Секрети й налаштування»); `TRANSLATE_SCHEMA`
+    поруч із `TRANSLATE_PROMPT`; `openai_key` → `anthropic_key` у `load_telegram_file`, `--chat-id` і коментарі
+    `TELEGRAM_FILE`; заголовок розділу «переклад (Claude)».
+  - `requirements.txt`: `anthropic>=1.13` (потрібен Python ≥ 3.10; на GitHub 3.12).
+  - `watch.yml`: `ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}` замість `OPENAI_API_KEY` і `OPENAI_MODEL`.
+  - README (розділ про переклад) і цей файл.
+- Перевірки: 20 з підставною відповіддю Claude (thinking-блок першим, refusal, max_tokens, не JSON, HTTP 429,
+  обрив зв'язку, без бібліотеки, російський текст — без виклику) + справжня бібліотека anthropic 1.13 з
+  підміненою мережею (тіло запиту: `model`, `system`, `messages`, `max_tokens`, `output_config` — без
+  `temperature`). Жодних повідомлень у групу.

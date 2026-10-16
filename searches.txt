@@ -7,15 +7,15 @@
 # У правильному посиланні є «?deal_types=...» і «cities=...».
 # Фільтр «Власник» скрипт додає сам, навіть якщо ви забули його увімкнути.
 #
-# Перед посиланням можна написати назву і « | » — вона буде видна в повідомленні.
+# Перед посиланням можна написати назву і « | » — вона буде видна в повідомленні (пишіть російською).
 # Приклад рядка:
-# Оренда | https://www.myhome.ge/ru/...?deal_types=2&real_estate_types=1&cities=...&owner_type=physical
+# Аренда | https://www.myhome.ge/ru/...?deal_types=2&real_estate_types=1&cities=...&owner_type=physical
 #
 # Після посилання можна дописати « | sale» — тоді оголошення підуть не в основну групу, а в групу
-# продажу (секрет TELEGRAM_CHAT_ID_SALE, локально "chat_id_sale" у telegram.json), і російською.
+# продажу (секрет TELEGRAM_CHAT_ID_SALE, локально "chat_id_sale" у telegram.json).
 # Поки секрету немає, такі рядки бот пропускає.
 
-Оренда | https://www.myhome.ge/ru/nedvizhimost/arenda/kvartira/batumi/?deal_types=2&real_estate_types=1&cities=15&currency_id=1&page=1&owner_type=physical
+Аренда | https://www.myhome.ge/ru/nedvizhimost/arenda/kvartira/batumi/?deal_types=2&real_estate_types=1&cities=15&currency_id=1&page=1&owner_type=physical
 
 # Продаж від власників — у групу продажу. Батумі (cities=15, у ньому й Махінджаурі) + місто Хелвачаурі (123)
 # і Хелвачаурський муніципалітет (202: Гоніо, Квариаті, Сарпі, Зелений Мис…). Чакві — окремими рядками: на

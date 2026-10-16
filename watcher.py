@@ -11,6 +11,7 @@ myhome.ge -> Telegram: нові оголошення від власників.
   python watcher.py --dump      зберегти «сирі» відповіді сайту у dump_list.json і dump_detail.json
 
 Посилання на пошук беруться з searches.txt, база побачених оголошень — state.json.
+Оренда йде в основну групу (українською), продаж («| sale» у searches.txt) — у групу продажу (російською).
 """
 
 import argparse
@@ -29,11 +30,15 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import no_realtors  # фільтр «не сотрудничаю с риелторами» — лише для груп із SKIP_NO_REALTORS (продаж)
+
 # ─────────────────────────────── НАЛАШТУВАННЯ ───────────────────────────────
 # Токен і chat_id беруться зі змінних середовища (на GitHub — Secrets),
 # а на своєму комп'ютері — з файлу telegram.json поруч зі скриптом.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # кілька чатів — через кому
+# Інші групи: пошук у searches.txt з третьою частиною «| sale» іде в чат з TELEGRAM_CHAT_ID_SALE
+# (у telegram.json — "chat_id_sale"). Без нього такий пошук пропускається, в основну групу не йде.
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # якщо задано — грузинські/англійські описи в чаті перекладаються
 AI_MODEL = "claude-haiku-5-5"  # до 14.10.2026 — OpenAI gpt-5-mini
 
@@ -47,6 +52,9 @@ AGENT_THRESHOLD = 3            # від скількох оголошень в �
 SKIP_SUSPECTED_AGENTS = False  # True — такі оголошення взагалі не надсилати
 SKIP_SITE_AGENTS = True        # сайт сам позначив автора «Агент» — не надсилати (False — надсилати з ⚠️)
 SKIP_SELF_DECLARED_AGENTS = True  # автор сам пише в описі «я агент» — не надсилати (False — надсилати з ⚠️)
+SKIP_NO_REALTORS = ("sale",)   # у цих групах не надсилати, якщо автор пише «с агентствами не сотрудничаю»,
+                               # «агентам не звонить» («сотрудничаю 50%» — надсилати); оренда — без фільтра
+GROUP_LANGS = {"sale": "ru"}   # мова повідомлень групи; основна (оренда для Олі) — українською
 MAX_ALERTS_PER_RUN = 25        # запобіжник від спаму; решта прийде наступного запуску
 LOOP_MINUTES = 10              # інтервал у безперервному режимі
 FAIL_ALERT_AFTER = 6           # після скількох невдалих перевірок поспіль написати в Telegram
@@ -58,7 +66,7 @@ TRANSLATE_BUDGET_SECONDS = 180 # не більше стільки секунд �
 BASE_DIR = Path(__file__).resolve().parent
 SEARCHES_FILE = BASE_DIR / "searches.txt"
 STATE_FILE = BASE_DIR / "state.json"
-TELEGRAM_FILE = BASE_DIR / "telegram.json"  # {"token": "...", "chat_id": "...", "anthropic_key": "..."} — не викладати на GitHub!
+TELEGRAM_FILE = BASE_DIR / "telegram.json"  # {"token": "...", "chat_id": "...", "chat_id_sale": "...", "anthropic_key": "..."} — не викладати на GitHub!
 
 API_URL = "https://api-statements.tnet.ge/v1/statements"
 SITE = "https://www.myhome.ge"
@@ -97,7 +105,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 def load_telegram_file():
     """Доповнює токен, chat_id і ключ Anthropic з telegram.json, якщо їх не задано змінними середовища."""
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY
+    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY, FILE_GROUP_CHATS
     if not TELEGRAM_FILE.exists():
         return
     try:
@@ -108,8 +116,11 @@ def load_telegram_file():
     TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or str(cfg.get("token") or "").strip()
     TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID or str(cfg.get("chat_id") or "").strip()
     ANTHROPIC_API_KEY = ANTHROPIC_API_KEY or str(cfg.get("anthropic_key") or "").strip()
+    FILE_GROUP_CHATS = {k[len("chat_id_"):].lower(): str(v or "").strip()
+                        for k, v in cfg.items() if k.startswith("chat_id_")}
 
 
+FILE_GROUP_CHATS = {}  # chat_id інших груп з telegram.json: {"sale": "-100…"}
 load_telegram_file()
 
 
@@ -192,12 +203,15 @@ def load_searches():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        label, url = ("", line)
-        if "|" in line:
-            label, url = (part.strip() for part in line.split("|", 1))
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) == 1:  # лише посилання, без назви
+            parts.insert(0, "")
+        label, url, group = (parts + [""])[:3]
         if "myhome.ge" not in url:
             continue  # рядок-заглушка або щось стороннє
-        searches.append((label or "myhome.ge", url))
+        if group and not re.fullmatch(r"[A-Za-z0-9_]+", group):
+            raise ConfigError(f"назва групи «{group}» — лише латинські літери, цифри й _ (наприклад, sale)")
+        searches.append((label or "myhome.ge", url, group.lower()))
     if not searches:
         raise ConfigError(f"у {SEARCHES_FILE.name} немає жодного посилання на myhome.ge — "
                           "вставте туди адресу сторінки пошуку (інструкція всередині файлу)")
@@ -280,7 +294,8 @@ def is_paid(item):
 
     У видачі myhome.ge платні завжди стоять першими — блоками Super VIP → VIP+ → VIP, кожен від
     свіжіших до старших, — і лише за ними звичайні; ні сортування, ні фільтра «без VIP» на сайті
-    немає (перевірено в Тбілісі 15.10.2026). В оренді Батумі платних ~59 (2,5 сторінки).
+    немає (перевірено в Тбілісі 15.10.2026). В оренді Батумі платних ~59 (2,5 сторінки), у продажу
+    квартир ~52, будинків 4, комерції 1 (16.10.2026).
     """
     return any(item.get(k) for k in ("is_super_vip", "is_vip_plus", "is_vip"))
 
@@ -521,27 +536,36 @@ def _parse_time(raw):
     return dt.astimezone(GEORGIA_TZ) if dt.tzinfo else dt
 
 
-def facts_text(item):
+def say(lang, uk, ru):
+    """Текст мовою групи (GROUP_LANGS): основна — українською, продаж — російською."""
+    return ru if lang == "ru" else uk
+
+
+def group_lang(group):
+    return GROUP_LANGS.get(group, "uk")
+
+
+def facts_text(item, lang="uk"):
     """«45 м² · кімнат: 2 · спалень: 1 · поверх 5/12»."""
     facts = []
     if clean(item.get("area")):
         facts.append(f"{fmt_area(item['area'])} м²")
     if clean(item.get("room")):
-        facts.append(f"кімнат: {clean(item['room'])}")
+        facts.append(say(lang, "кімнат", "комнат") + f": {clean(item['room'])}")
     if clean(item.get("bedroom")):
-        facts.append(f"спалень: {clean(item['bedroom'])}")
+        facts.append(say(lang, "спалень", "спален") + f": {clean(item['bedroom'])}")
     if clean(item.get("floor")):
         total = clean(item.get("total_floors"))
-        facts.append(f"поверх {clean(item['floor'])}" + (f"/{total}" if total else ""))
+        facts.append(say(lang, "поверх", "этаж") + f" {clean(item['floor'])}" + (f"/{total}" if total else ""))
     return " · ".join(facts)
 
 
-def listing_time(item):
+def listing_time(item, lang="uk"):
     """«25.09 02:01», а якщо оголошення потім піднімали — «25.09 02:01, оновлено 27.09 14:03»."""
     created = _parse_time(item.get("created_at") or item.get("create_date"))
     updated = _parse_time(item.get("last_updated"))
     if created and updated and updated.date() != created.date():
-        return f"{created:%d.%m %H:%M}, оновлено {updated:%d.%m %H:%M}"
+        return f"{created:%d.%m %H:%M}, " + say(lang, "оновлено", "обновлено") + f" {updated:%d.%m %H:%M}"
     moment = created or updated
     return moment.strftime("%d.%m %H:%M") if moment else ""
 
@@ -582,15 +606,15 @@ def visible_len(text):
     return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
 
 
-def build_message(item, label, count, max_len=4096):
+def build_message(item, label, count, max_len=4096, lang="uk"):
     def esc(value):
         return html.escape(clean(value), quote=False)
 
-    lines = [f"🏠 <b>{esc(item.get('dynamic_title')) or 'Нове оголошення'}</b>"]
+    lines = [f"🏠 <b>{esc(item.get('dynamic_title')) or say(lang, 'Нове оголошення', 'Новое объявление')}</b>"]
     if price_text(item):
         lines.append(f"💵 {esc(price_text(item))}")
 
-    facts = esc(facts_text(item))
+    facts = esc(facts_text(item, lang))
     if facts:
         lines.append("📐 " + facts)
 
@@ -606,32 +630,35 @@ def build_message(item, label, count, max_len=4096):
     if phone:
         who.append(f"📞 {phone}")
     elif "*" in masked:
-        who.append(f"📞 {esc(masked)} (повністю — на сайті)")
+        who.append(f"📞 {esc(masked)} " + say(lang, "(повністю — на сайті)", "(полностью — на сайте)"))
     if who:
         lines.append("👤 " + " · ".join(who))
 
-    when = listing_time(item)
+    when = listing_time(item, lang)
     lines.append(" · ".join(x for x in (f"🕒 {when}" if when else "", f"🔎 {esc(label)}") if x))
 
     agent_text, owner_text = text_signals(plain_text(item.get("comment")))
     if is_site_agent(item):
-        lines.append("⚠️ На myhome.ge автор позначений як агент")
+        lines.append(say(lang, "⚠️ На myhome.ge автор позначений як агент", "⚠️ На myhome.ge автор отмечен как агент"))
     site = item.get("_site_count")
     if isinstance(site, int):
-        words = plural(site, "оголошення", "оголошення", "оголошень")
+        words = plural(site, *say(lang, ("оголошення", "оголошення", "оголошень"),
+                                  ("объявление", "объявления", "объявлений")))
         if site >= AGENT_THRESHOLD:
-            lines.append(f"⚠️ У автора {site} {words} на myhome.ge — агент або інвестор")
+            lines.append(f"⚠️ У автора {site} {words} на myhome.ge — " + say(lang, "агент або інвестор", "агент или инвестор"))
         else:
             lines.append(f"✅ У автора {site} {words} на myhome.ge")
     if count >= AGENT_THRESHOLD and (not isinstance(site, int) or count > site):
-        words = plural(count, "оголошенні", "оголошеннях", "оголошеннях")
-        lines.append(f"⚠️ Цей автор або телефон уже трапився в {count} {words} — агент або інвестор")
+        words = plural(count, *say(lang, ("оголошенні", "оголошеннях", "оголошеннях"),
+                                   ("объявлении", "объявлениях", "объявлениях")))
+        lines.append(say(lang, f"⚠️ Цей автор або телефон уже трапився в {count} {words} — агент або інвестор",
+                         f"⚠️ Этот автор или телефон уже встречался в {count} {words} — агент или инвестор"))
     if agent_text:
-        lines.append("⚠️ В описі згадується агенція або комісія")
+        lines.append(say(lang, "⚠️ В описі згадується агенція або комісія", "⚠️ В описании упоминается агентство или комиссия"))
     elif owner_text:
-        lines.append("✍️ Пише, що без посередників")
+        lines.append(say(lang, "✍️ Пише, що без посередників", "✍️ Пишет, что без посредников"))
 
-    link = f'🔗 <a href="{html.escape(listing_url(item))}">Відкрити на myhome.ge</a>'
+    link = f'🔗 <a href="{html.escape(listing_url(item))}">{say(lang, "Відкрити на myhome.ge", "Открыть на myhome.ge")}</a>'
     message = "\n".join(lines)
     desc = item.get("_ru_comment") or plain_text(item.get("comment"))
     budget = min(400, max_len - visible_len(message) - visible_len(link) - 10)
@@ -641,20 +668,23 @@ def build_message(item, label, count, max_len=4096):
     return message + "\n\n" + link
 
 
-def print_listing(item, label, count):
-    plain = html.unescape(re.sub(r"<[^>]+>", "", build_message(item, label, count)))
+def print_listing(item, label, count, lang="uk"):
+    plain = html.unescape(re.sub(r"<[^>]+>", "", build_message(item, label, count, lang=lang)))
     print("-" * 60)
-    print(plain.replace("Відкрити на myhome.ge", listing_url(item)), flush=True)
+    print(plain.replace(say(lang, "Відкрити на myhome.ge", "Открыть на myhome.ge"), listing_url(item)), flush=True)
 
 
 # ─────────────────────────────── Telegram ───────────────────────────────
 
-def chat_ids():
-    return [c.strip() for c in str(TELEGRAM_CHAT_ID).split(",") if c.strip()]
+def chat_ids(group=""):
+    """Чати групи: основна — TELEGRAM_CHAT_ID, інша (sale) — TELEGRAM_CHAT_ID_SALE."""
+    raw = (os.getenv(f"TELEGRAM_CHAT_ID_{group.upper()}") or FILE_GROUP_CHATS.get(group, "")
+           if group else TELEGRAM_CHAT_ID)
+    return [c.strip() for c in str(raw).split(",") if c.strip()]
 
 
-def telegram_ready():
-    return bool(TELEGRAM_BOT_TOKEN and chat_ids())
+def telegram_ready(group=""):
+    return bool(TELEGRAM_BOT_TOKEN and chat_ids(group))
 
 
 def _post_json(url, payload, headers=None, timeout=30):
@@ -693,8 +723,8 @@ def tg_call(method, payload):
     return {"ok": False, "description": "забагато спроб"}
 
 
-def send_text(text):
-    for chat in chat_ids():
+def send_text(text, group=""):
+    for chat in chat_ids(group):
         result = tg_call("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
                                          "link_preview_options": {"is_disabled": True}})
         if not result.get("ok"):
@@ -770,15 +800,16 @@ def send_photo(chat, urls, caption):
     return result
 
 
-def send_listing(item, label, count):
-    """Надсилає оголошення у всі чати. True, якщо дійшло хоча б в один."""
+def send_listing(item, label, count, group=""):
+    """Надсилає оголошення у всі чати групи її мовою. True, якщо дійшло хоча б в один."""
     photos = image_urls(item)
-    caption = build_message(item, label, count, max_len=1024)
-    full_text = build_message(item, label, count)
+    lang = group_lang(group)
+    caption = build_message(item, label, count, max_len=1024, lang=lang)
+    full_text = build_message(item, label, count, lang=lang)
     if not photos:
         log(f"  оголошення {item['id']}: на сайті немає фото")
     delivered = False
-    for chat in chat_ids():
+    for chat in chat_ids(group):
         result = send_photo(chat, photos, caption) if photos else {"ok": False}
         if not result.get("ok"):  # фото не підійшло — шлемо текстом
             result = tg_call("sendMessage", {"chat_id": chat, "text": full_text,
@@ -826,7 +857,7 @@ def claude_json(system, data, schema):
     return parts
 
 
-TRANSLATE_PROMPT = """Переведи на русский язык описание и адрес объявления об аренде квартиры в Батуми.
+TRANSLATE_PROMPT = """Переведи на русский язык описание и адрес объявления о недвижимости в Батуми и окрестностях.
 Верни JSON: {"description": "...", "address": "..."}.
 Переводи точно, ничего не добавляй и не сокращай, эмодзи оставь. Названия улиц передавай
 по-русски: «რუსთაველის ქ. 15» → «ул. Руставели 15», «ჭავჭავაძის ქ.» → «ул. Чавчавадзе».
@@ -920,7 +951,11 @@ def run_once(state):
     seen = seen_ids(state)
     candidates, batch, any_ok = [], set(), False
 
-    for label, url in searches:
+    for label, url, group in searches:
+        if group and telegram_ready() and not telegram_ready(group):
+            log(f"[{label}] не задано чат групи «{group}» (секрет TELEGRAM_CHAT_ID_{group.upper()}) — "
+                "пропускаю пошук")
+            continue
         try:
             params = search_params(url)
         except ConfigError as e:
@@ -981,30 +1016,33 @@ def run_once(state):
                 continue
             state["searches"][key] = day
             log(f"[{label}] перший запуск: запам'ятав {len(found)} оголошень, далі — лише нові")
-            if telegram_ready():
-                send_text(f"✅ Стежу за пошуком «{html.escape(label)}». Поточні {len(found)} "
-                          "оголошень запам'ятав — надсилатиму тільки нові.")
+            if telegram_ready(group):
+                send_text(say(group_lang(group),
+                              f"✅ Стежу за пошуком «{html.escape(label)}». Поточні {len(found)} "
+                              "оголошень запам'ятав — надсилатиму тільки нові.",
+                              f"✅ Слежу за поиском «{html.escape(label)}». Текущие {len(found)} "
+                              "объявлений запомнил — буду присылать только новые."), group)
             continue
 
         for item in found:
             listing_id = int(item["id"])
             if listing_id not in seen and listing_id not in batch:
                 batch.add(listing_id)
-                candidates.append((label, item))
+                candidates.append((label, group, item))
 
     update_fail_streak(state, any_ok)
     if not candidates:
         log("нових оголошень немає" if any_ok else "не вдалося отримати дані з myhome.ge")
         return
 
-    candidates.sort(key=lambda c: int(c[1]["id"]), reverse=True)  # новіші мають більший id
+    candidates.sort(key=lambda c: int(c[2]["id"]), reverse=True)  # новіші мають більший id
     if len(candidates) > MAX_ALERTS_PER_RUN:
         log(f"нових {len(candidates)}, надсилаю {MAX_ALERTS_PER_RUN}, решту — наступного разу")
         candidates = candidates[:MAX_ALERTS_PER_RUN]
     candidates.reverse()  # у чаті йдуть від старших до новіших
 
     sent, translate_deadline = 0, time.time() + TRANSLATE_BUDGET_SECONDS
-    for label, item in candidates:
+    for label, group, item in candidates:
         if FETCH_DETAILS:
             enrich_with_details(item)
             time.sleep(random.uniform(0.5, 1.2))
@@ -1022,10 +1060,14 @@ def run_once(state):
         else:
             if ANTHROPIC_API_KEY and TRANSLATE_ALERTS and time.time() < translate_deadline:
                 translate_listing(item)
-            if telegram_ready():
-                delivered = send_listing(item, label, count)
+            if group in SKIP_NO_REALTORS and no_realtors.refuses_realtors(
+                    plain_text(item.get("comment")) + " " + str(item.get("_ru_comment") or "")):
+                log(f"  пропускаю {item['id']}: автор пише, що не співпрацює з рієлторами")
+                delivered = True
+            elif telegram_ready(group):
+                delivered = send_listing(item, label, count, group)
             else:
-                print_listing(item, label, count)
+                print_listing(item, label, count, group_lang(group))
                 delivered = True
         if delivered:  # не дійшло — спробуємо наступного запуску
             mark_seen(state, item["id"], day)
@@ -1053,14 +1095,14 @@ def cmd_loop():
 
 
 def cmd_test():
-    label, url = load_searches()[0]
+    label, url, group = load_searches()[0]
     params = search_params(url)
     log(f"[{label}] запит до myhome.ge...")
     items = fetch_page(params, 1)
     cities = sorted({clean(it.get("city_name")) for it in items if clean(it.get("city_name"))})
     log(f"[{label}] на першій сторінці {len(items)} оголошень; міста: {', '.join(cities) or '—'}")
     for item in items[:3]:
-        print_listing(item, label, 0)
+        print_listing(item, label, 0, group_lang(group))
     if not items:
         log("Порожньо. Перевірте, що за цим посиланням на сайті є оголошення.")
         return 0
@@ -1071,8 +1113,8 @@ def cmd_test():
     else:
         log("Кількість оголошень автора в даних сайту не знайдено. Запустіть "
             "python watcher.py --dump і надішліть файли dump_list.json та dump_detail.json.")
-    if telegram_ready():
-        ok = send_listing(item, f"🧪 ТЕСТ · {label}", 0)
+    if telegram_ready(group):
+        ok = send_listing(item, f"🧪 ТЕСТ · {label}", 0, group)
         log("Тестове повідомлення надіслано ✅" if ok else "Не вдалося надіслати в Telegram ❌")
     else:
         log("Telegram ще не налаштований: вкажіть TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID.")
@@ -1081,7 +1123,7 @@ def cmd_test():
 
 def cmd_dump():
     """Зберігає «сирі» відповіді сайту, щоб подивитися, які поля там є."""
-    label, url = load_searches()[0]
+    label, url, _ = load_searches()[0]
     raw_list = page_statements(http_get(list_url(search_params(url), 1), {"Accept-Language": LANG}))
     (BASE_DIR / "dump_list.json").write_text(
         json.dumps(raw_list, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1138,6 +1180,7 @@ def cmd_chat_id():
     global TELEGRAM_CHAT_ID
     TELEGRAM_CHAT_ID = str(choice)
     config = {"token": TELEGRAM_BOT_TOKEN, "chat_id": TELEGRAM_CHAT_ID}
+    config.update({f"chat_id_{group}": chats for group, chats in FILE_GROUP_CHATS.items() if chats})
     if ANTHROPIC_API_KEY:
         config["anthropic_key"] = ANTHROPIC_API_KEY
     TELEGRAM_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -5605,8 +5605,8 @@
 "2026-09-28"
 ],
 "u:9744800": [
-1,
-"2026-10-16"
+2,
+"2026-10-17"
 ],
 "u:9749538": [
 1,
@@ -6141,7 +6141,7 @@
 "2026-10-15"
 ]
 },
-"fail_streak": 1,
+"fail_streak": 0,
 "regular_seeded": [
 "cities=15&currency_id=1&deal_types=2&owner_type=physical&real_estate_types=1",
 "cities=15,123,202&deal_types=1&owner_type=physical&real_estate_types=1",
@@ -8044,7 +8044,8 @@
 26370410,
 26370437,
 26370537,
-26370539
+26370539,
+26370560
 ]
 },
 "version": 1

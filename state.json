@@ -1416,6 +1416,10 @@
 1,
 "2026-09-27"
 ],
+"u:2354832": [
+1,
+"2026-10-16"
+],
 "u:2367382": [
 1,
 "2026-09-28"
@@ -6093,7 +6097,7 @@
 "2026-10-15"
 ]
 },
-"fail_streak": 1,
+"fail_streak": 0,
 "regular_seeded": [
 "cities=15&currency_id=1&deal_types=2&owner_type=physical&real_estate_types=1",
 "cities=15,123,202&deal_types=1&owner_type=physical&real_estate_types=1",
@@ -7982,7 +7986,8 @@
 26370112,
 26370164,
 26370200,
-26370236
+26370236,
+26370278
 ]
 },
 "version": 1
